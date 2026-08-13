@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import omnigent._platform as _platform
+from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
@@ -1352,6 +1353,74 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     """Date-shaped Cursor versions are stripped to ``YYYY.MM.DD`` so PEP 440 can
     compare them; normal semver versions stay unchanged."""
     assert hi._parse_harness_cli_version(raw) == expected
+
+
+# ``hermes --version`` verbatim: four version-like tokens, only the first two of
+# which are Hermes's own, in two different numbering schemes.
+_HERMES_VERSION_OUTPUT = (
+    "Hermes Agent v0.20.0 (2026.8.3)\n"
+    "Install directory: /opt/homebrew/Cellar/hermes-agent/2026.8.3_1/libexec/"
+    "lib/python3.14/site-packages\n"
+    "Python: 3.14.6\n"
+    "OpenAI SDK: 2.24.0\n"
+    "Run 'hermes version' for update status.\n"
+)
+
+
+def test_parse_harness_cli_version_prefers_candidate_matching_a_date_floor() -> None:
+    """A date-shaped floor selects the calendar token, not the leading semver.
+
+    Regression for the permanently-false comparison: ``search`` returned
+    ``0.20.0`` from Hermes's banner, which no upgrade could ever push past a
+    ``2026.*`` floor, so ``hermes-native`` reported BLOCKED with a compliant CLI
+    installed and an upgrade hint that could not possibly help.
+    """
+    spec = HarnessInstallSpec("Hermes", "hermes", package=None, min_version="2026.06.05")
+    assert hi._parse_harness_cli_version(_HERMES_VERSION_OUTPUT, spec) == "2026.08.03"
+
+
+def test_parse_harness_cli_version_prefers_candidate_matching_a_semver_floor() -> None:
+    """A semver floor selects the banner semver, skipping the calendar token."""
+    spec = HarnessInstallSpec("Hermes", "hermes", package=None, min_version="0.17.0")
+    assert hi._parse_harness_cli_version(_HERMES_VERSION_OUTPUT, spec) == "0.20.0"
+
+
+def test_parse_harness_cli_version_explicit_pattern_beats_shape_heuristic() -> None:
+    """A declared ``version_pattern`` outranks the shape heuristic.
+
+    Hermes ships one because shape alone cannot tell its semver from the Python
+    and OpenAI-SDK semvers further down the output — today only output order
+    keeps them out of the way.
+    """
+    spec = hi._HARNESS_INSTALL[hi.HERMES_KEY]
+    assert spec.version_pattern is not None
+    assert hi._parse_harness_cli_version(_HERMES_VERSION_OUTPUT, spec) == "0.20.0"
+
+
+def test_parse_harness_cli_version_without_spec_keeps_first_match() -> None:
+    """Omitting the spec preserves the historical first-match behavior."""
+    assert hi._parse_harness_cli_version(_HERMES_VERSION_OUTPUT) == "0.20.0"
+
+
+def test_parse_harness_cli_version_falls_back_when_no_candidate_matches_shape() -> None:
+    """A floor whose scheme appears nowhere in the output still yields a version."""
+    spec = HarnessInstallSpec("Fake", "fake", package=None, min_version="2026.06.05")
+    assert hi._parse_harness_cli_version("fake version 1.2.3", spec) == "1.2.3"
+
+
+def test_hermes_spec_floor_and_pattern_agree_on_scheme() -> None:
+    """Hermes's floor and its extraction pattern must select the same scheme.
+
+    If the floor is ever moved back to a calendar version, this pins the pattern
+    to be moved with it rather than silently reintroducing a cross-scheme
+    comparison.
+    """
+    spec = hi._HARNESS_INSTALL[hi.HERMES_KEY]
+    extracted = hi._parse_harness_cli_version(_HERMES_VERSION_OUTPUT, spec)
+    assert extracted is not None
+    assert hi._is_date_shaped_version(extracted) == hi._is_date_shaped_version(
+        spec.min_version or ""
+    )
 
 
 @pytest.mark.parametrize(

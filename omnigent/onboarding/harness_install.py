@@ -112,7 +112,10 @@ KIRO_KEY = "kiro"
 #   2026-06-01 is 0.7.0.
 # - hermes: parent_session_id schema introduced in v0.17.0. Hermes reports a
 #   semver version with the build date alongside it
-#   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
+#   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver. It also
+#   prints its Python and OpenAI-SDK versions on the following lines, so which
+#   token the parser lands on is not something to leave to shape alone —
+#   ``_HERMES_VERSION_PATTERN`` pins it to the semver on the banner line.
 _CODEX_MIN_VERSION = "0.137.0"
 _PI_MIN_VERSION = "0.79.0"
 _QWEN_MIN_VERSION = "0.18.1"
@@ -147,6 +150,18 @@ COPILOT_KEY = "copilot"
 HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+
+# ``hermes --version`` prints its own semver and calendar release on the banner
+# line, then two unrelated versions (Python, OpenAI SDK) on later lines:
+#
+#     Hermes Agent v0.20.0 (2026.8.3)
+#     Install directory: /opt/homebrew/Cellar/hermes-agent/2026.8.3_1/...
+#     Python: 3.14.6
+#     OpenAI SDK: 2.24.0
+#
+# Four version-like tokens, two of which are not Hermes's version at all. Anchor
+# on the banner so the floor is always compared against the same token.
+_HERMES_VERSION_PATTERN = r"Hermes Agent v(?P<version>\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)"
 
 # Anthropic recommends its native installer over ``npm install -g``: it writes
 # to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
@@ -301,6 +316,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint=_HERMES_INSTALL_HINT,
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
         min_version=_HERMES_MIN_VERSION,
+        version_pattern=_HERMES_VERSION_PATTERN,
     ),
 }
 
@@ -696,6 +712,33 @@ def harness_setup_hint(harness: str | None) -> str:
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 
 
+def _date_version_parts(version: str) -> tuple[int, int, int] | None:
+    """Return ``(year, month, day)`` when *version* is date-shaped, else ``None``.
+
+    The single definition of "date-shaped" shared by
+    :func:`_normalize_date_version` (which trims) and
+    :func:`_is_date_shaped_version` (which only asks).
+    """
+    parts = re.split(r"[.-]", (version or "").replace("_", "-"))
+    if len(parts) < 3:
+        return None
+    try:
+        year = int(parts[0])
+        month = int(parts[1])
+        day = int(parts[2])
+    except ValueError:
+        return None
+    # Treat plausible calendar dates (year 2000-2199) as date versions.
+    if 2000 <= year <= 2199 and 1 <= month <= 12 and 1 <= day <= 31:
+        return year, month, day
+    return None
+
+
+def _is_date_shaped_version(version: str) -> bool:
+    """Whether *version* looks like a ``YYYY.MM.DD`` calendar release."""
+    return _date_version_parts(version) is not None
+
+
 def _normalize_date_version(version: str) -> str:
     """Trim date-shaped versions (``YYYY.MM.DD[-build]``) to their date part.
 
@@ -704,22 +747,17 @@ def _normalize_date_version(version: str) -> str:
     as PEP 440, but the leading ``YYYY.MM.DD`` is enough to compare chronology.
     Normalizing keeps semver versions intact so existing parsing is unaffected.
     """
-    parts = re.split(r"[.-]", version.replace("_", "-"))
-    if len(parts) < 3:
+    parts = _date_version_parts(version)
+    if parts is None:
         return version
-    try:
-        year = int(parts[0])
-        month = int(parts[1])
-        day = int(parts[2])
-    except ValueError:
-        return version
-    # Treat plausible calendar dates (year 2000-2199) as date versions.
-    if 2000 <= year <= 2199 and 1 <= month <= 12 and 1 <= day <= 31:
-        return f"{year}.{month:02d}.{day:02d}"
-    return version
+    year, month, day = parts
+    return f"{year}.{month:02d}.{day:02d}"
 
 
-def _parse_harness_cli_version(text: str) -> str | None:
+def _parse_harness_cli_version(
+    text: str,
+    spec: HarnessInstallSpec | None = None,
+) -> str | None:
     """Extract a semver-ish string from ``<binary> --version`` output.
 
     Mirrors the OpenCode-specific parser in
@@ -727,11 +765,58 @@ def _parse_harness_cli_version(text: str) -> str | None:
     kept generic so any harness can declare a version range in its install spec.
     Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
     ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.
+
+    Extraction is **scheme-aware**, not first-match. A CLI may print several
+    version-like tokens, from more than one numbering scheme, and the first one
+    is not reliably the release the spec's bounds are written against. Hermes
+    prints all of these on one ``--version`` invocation::
+
+        Hermes Agent v0.20.0 (2026.8.3)     <- its semver AND its calendar release
+        Install directory: .../2026.8.3_1/...
+        Python: 3.14.6                      <- not Hermes's version at all
+        OpenAI SDK: 2.24.0                  <- nor this one
+
+    Taking ``search``'s first hit compares whichever token happens to come first
+    against a bound that may be written in the other scheme — a comparison
+    across numbering schemes, which is meaningless and can be permanently false
+    no matter what the user installs. So:
+
+    1. An explicit ``spec.version_pattern`` wins when it matches. It is opt-in
+       and only set for CLIs where the shape heuristic is known to be
+       insufficient, so declared author intent outranks the heuristic.
+    2. Otherwise prefer, in output order, the first candidate whose **shape**
+       matches the shape of the spec's own bound — date-shaped bound picks a
+       date-shaped candidate, semver bound picks a semver candidate.
+    3. With no spec, no bound, or no shape match, fall back to the historical
+       first-match behavior.
+
+    :param spec: The install spec whose bounds this version will be compared
+        against, when known. Passing it is what enables (1) and (2); omitting it
+        preserves the original first-match semantics.
     """
-    match = _VERSION_RE.search(text or "")
-    if match is None:
+    candidates = _VERSION_RE.findall(text or "")
+    if not candidates:
         return None
-    return _normalize_date_version(match.group(1))
+
+    if spec is not None and spec.version_pattern is not None:
+        match = re.search(spec.version_pattern, text or "")
+        if match is not None:
+            groups = match.groupdict()
+            explicit = groups.get("version") if "version" in groups else None
+            if explicit is None:
+                explicit = match.group(1) if match.re.groups else match.group(0)
+            return _normalize_date_version(explicit)
+
+    bound = None
+    if spec is not None:
+        bound = spec.min_version or spec.max_version_exclusive
+    if bound is not None:
+        want_date = _is_date_shaped_version(bound)
+        for candidate in candidates:
+            if _is_date_shaped_version(candidate) == want_date:
+                return _normalize_date_version(candidate)
+
+    return _normalize_date_version(candidates[0])
 
 
 # Wall-clock cap on a harness CLI probe subprocess (``--version`` /
@@ -901,7 +986,9 @@ def _harness_cli_version_string(
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return _parse_harness_cli_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
+    return _parse_harness_cli_version(
+        (completed.stdout or "") + "\n" + (completed.stderr or ""), spec
+    )
 
 
 def harness_install_command(key: str) -> list[str]:

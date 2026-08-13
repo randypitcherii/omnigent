@@ -28,6 +28,14 @@ class HarnessInstallSpec:
     """Minimum supported CLI version (inclusive)."""
     max_version_exclusive: str | None = None
     """Maximum supported CLI version (exclusive)."""
+    version_pattern: str | None = None
+    """Explicit regex extracting this CLI's version from its ``--version`` output.
+
+    Only needed for CLIs that print several version-like tokens, where picking
+    the right one by shape alone is luck. The version is read from a named
+    ``version`` group when present, else group 1, else the whole match. Leave
+    ``None`` to let the generic scheme-aware extraction choose.
+    """
 
 
 @dataclass(frozen=True)
