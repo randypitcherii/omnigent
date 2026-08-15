@@ -1798,6 +1798,8 @@ function MainAgentSurface({
           conversationId={conversationId}
           initialTerminalKey={terminalFirst?.terminalViewKey}
           onSurfaceElement={setTerminalSurfaceEl}
+          resumeRequired={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+          canResume={permissionLevel === null || permissionLevel >= 2}
           // Non-owners attach read-only: a shared PTY can't attribute
           // input per-user, so only the owner may type. They drive the
           // agent via the composer instead. Server enforces this too.
@@ -3162,6 +3164,7 @@ function useNativeChatTerminalBar(
   const native = isIOSShell();
   const view = ctx?.view ?? "chat";
   const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalResumable = ctx?.terminalResumable ?? false;
   const terminalStartingUp = ctx?.terminalStartingUp ?? false;
 
   // Keep `setView` reachable from the subscribe-once effect without
@@ -3174,11 +3177,11 @@ function useNativeChatTerminalBar(
     if (!native) return;
     setNativeViewMode({
       mode: view,
-      terminalEnabled: terminalsAvailable,
+      terminalEnabled: terminalsAvailable || terminalResumable,
       terminalStartingUp,
       visible,
     });
-  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+  }, [native, view, terminalsAvailable, terminalResumable, terminalStartingUp, visible]);
 
   // Belt-and-suspenders: hide the bar if the host component ever unmounts.
   useEffect(() => {

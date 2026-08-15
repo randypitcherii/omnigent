@@ -157,4 +157,25 @@ describe("ViewModeToggle", () => {
     expect(terminalItem).toHaveAttribute("aria-disabled", "true");
     expect(terminalItem.querySelector(".animate-spin")).toBeNull();
   });
+
+  it("keeps Terminal selectable when the paused session can be resumed", async () => {
+    const setView = vi.fn();
+    renderToggle(
+      makeCtx({
+        setView,
+        terminalsAvailable: false,
+        terminalResumable: true,
+        terminalStartingUp: false,
+      }),
+    );
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: /switch between chat and terminal/i }),
+      { button: 0 },
+    );
+    const terminalItem = await screen.findByRole("menuitemradio", { name: /^terminal$/i });
+
+    expect(terminalItem).not.toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(terminalItem);
+    expect(setView).toHaveBeenCalledWith("terminal");
+  });
 });

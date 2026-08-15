@@ -40,7 +40,8 @@ export function ViewModeToggle() {
   const closedByPointerRef = useRef(false);
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
 
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+  const { view, setView, terminalsAvailable, terminalResumable = false, terminalStartingUp } = ctx;
+  const terminalEnabled = terminalsAvailable || terminalResumable;
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -103,12 +104,13 @@ export function ViewModeToggle() {
             <MessagesSquareIcon className="size-4" />
             Chat
           </DropdownMenuRadioItem>
-          {/* Terminal disabled until a PTY is reachable; a spinner while it's
-              coming up reads as "loading" rather than a dead option. */}
+          {/* A paused session remains selectable so its terminal surface can
+              offer the explicit resume action. Other unavailable terminals
+              stay disabled; a spinner marks active startup. */}
           <DropdownMenuRadioItem
             value="terminal"
             className="gap-2"
-            disabled={!terminalsAvailable}
+            disabled={!terminalEnabled}
             title={terminalStartingUp ? "Terminal is starting up…" : undefined}
           >
             {terminalStartingUp ? (
