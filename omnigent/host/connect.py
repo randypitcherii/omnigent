@@ -2743,6 +2743,15 @@ class HostProcess:
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
+            # A server behind an authenticating proxy (e.g. Databricks
+            # Apps) bounces bare upgrades to a login page. When the
+            # sandbox carries ambient platform credentials, additionally
+            # attach a Bearer so the proxy passes the tunnel through;
+            # acquisition failures are swallowed, so a credential-less
+            # sandbox behaves exactly as before.
+            token = self._current_auth_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             return headers
         token = self._current_auth_token()
         if token:
@@ -2760,12 +2769,8 @@ class HostProcess:
             Runner launch passes ``False`` because it must only reuse the
             already-warm host context, never add auth work to the launch path.
         :returns: Current bearer token, or ``None`` when credentials are not
-            available or this is a managed host authenticated by launch token.
+            available.
         """
-        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
-
-        if os.environ.get(HOST_TOKEN_ENV_VAR):
-            return None
         try:
             if not self._auth_token_factory_resolved:
                 if not initialize:

@@ -944,7 +944,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         if databricks_section is not None:
             _reject_unknown_keys(
                 databricks_section,
-                {"cli_path", "profile", "idle_timeout", "no_autostop"},
+                {"cli_path", "profile", "idle_timeout", "no_autostop", "bootstrap_command"},
                 "sandbox.databricks",
             )
         no_autostop = _parse_provider_bool(raw, "databricks", "no_autostop")
@@ -953,6 +953,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             profile=_parse_provider_string(raw, "databricks", "profile"),
             idle_timeout=_parse_provider_string(raw, "databricks", "idle_timeout"),
             no_autostop=True if no_autostop is None else no_autostop,
+            bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
         )
         token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
@@ -1700,6 +1701,7 @@ def _databricks_launcher_factory(
     profile: str | None,
     idle_timeout: str | None,
     no_autostop: bool,
+    bootstrap_command: str | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: databricks`` path.
@@ -1728,6 +1730,7 @@ def _databricks_launcher_factory(
             profile=profile,
             idle_timeout=idle_timeout,
             no_autostop=no_autostop,
+            bootstrap_command=bootstrap_command,
         )
 
     return _build

@@ -354,6 +354,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         profile: str | None = None,
         idle_timeout: str | None = None,
         no_autostop: bool = True,
+        bootstrap_command: str | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -378,6 +379,20 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         self._profile = profile
         self._idle_timeout = idle_timeout
         self._no_autostop = no_autostop
+        self._bootstrap_command = bootstrap_command
+
+    def start_host(self, sandbox_id: str, **kwargs):  # type: ignore[override]
+        """Run the configured bootstrap, then start the host as usual.
+
+        ``sandbox.databricks.bootstrap_command`` exists because the
+        sandbox image's preinstalled omnigent can lag the server; the
+        operator-supplied command (typically a self-update from git)
+        runs on every host start — fresh provisions AND resumes — so a
+        revived sandbox is refreshed before ``omnigent host`` launches.
+        """
+        if self._bootstrap_command:
+            self.run(sandbox_id, self._bootstrap_command)
+        return super().start_host(sandbox_id, **kwargs)
 
     # ── CLI plumbing ────────────────────────────────────
 
