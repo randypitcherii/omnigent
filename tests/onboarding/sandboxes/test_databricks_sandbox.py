@@ -8,6 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import click
@@ -18,6 +19,7 @@ from omnigent.onboarding.sandboxes.databricks_sandbox import (
     AUTH_HINT,
     INSTALL_HINT,
     DatabricksSandboxLauncher,
+    JobBootstrapConfig,
 )
 
 # ── Fake `databricks` CLI ───────────────────────────────────
@@ -737,3 +739,522 @@ def test_wheel_install_command_quotes_the_tarball_path() -> None:
     """The tarball path is interpolated into a shell command; quote it."""
     command = DatabricksSandboxLauncher().wheel_install_command("/tmp/a b.tgz")
     assert "'/tmp/a b.tgz'" in command
+
+
+# ── job-delegated bootstrap ──────────────────────────────────
+#
+# A Databricks App container cannot reach the sandbox SSH gateway on port
+# 2222 (private-link stub, only 443 routes there), so `JobBootstrapConfig`
+# delegates the one-time bootstrap SSH session to a classic-compute job,
+# whose allow-all egress baseline CAN reach it (verified live: a classic
+# job got a real SSH banner back on 2222; a serverless job got the same
+# "no route to host" the App container reports).
+#
+# `_run_via_job` imports `databricks.sdk` lazily inside the method it
+# backs (an optional extra, per the module docstring), so these fakes are
+# built and the SDK itself imported only inside test bodies — never at
+# module level — so this file stays collectible on lanes that never
+# installed the `databricks` extra. Every test that touches the fake
+# `WorkspaceClient` is marked `@pytest.mark.databricks`, matching
+# `tests/db/test_utils.py`'s convention; tests that only exercise script
+# composition or the unmodified direct-SSH path carry no marker.
+
+
+@dataclass
+class _FakeSecrets:
+    """Records every ``secrets.put_secret`` / ``delete_secret`` call."""
+
+    put_calls: list[tuple[str, str, str]] = field(default_factory=list)
+    delete_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def put_secret(self, *, scope: str, key: str, string_value: str) -> None:
+        self.put_calls.append((scope, key, string_value))
+
+    def delete_secret(self, *, scope: str, key: str) -> None:
+        self.delete_calls.append((scope, key))
+
+
+@dataclass
+class _FakeWorkspace:
+    """Records every ``workspace.upload`` call (the driver notebook)."""
+
+    uploads: list[tuple[str, bytes]] = field(default_factory=list)
+
+    def upload(self, path: str, *, content: bytes, overwrite: bool = True) -> None:
+        self.uploads.append((path, content))
+
+
+@dataclass
+class _FakeWait:
+    """Stands in for the ``Wait`` object ``jobs.submit`` returns."""
+
+    run: SimpleNamespace
+
+    def result(self) -> SimpleNamespace:
+        return self.run
+
+
+@dataclass
+class _FakeJobs:
+    """
+    Fakes the two Jobs-API calls the job-bootstrap path makes.
+
+    :param result_state: The canned terminal ``RunResultState`` the fake
+        run reports.
+    :param notebook_output: The value ``dbutils.notebook.exit()`` would
+        have carried back, or ``None`` to simulate a run whose output
+        must be recovered from ``logs``/``error`` instead.
+    """
+
+    result_state: Any
+    notebook_output: str | None = None
+    logs: str | None = None
+    error: str | None = None
+    submit_calls: list[dict[str, Any]] = field(default_factory=list)
+    run_output_calls: list[int] = field(default_factory=list)
+
+    def submit(self, **kwargs: Any) -> _FakeWait:
+        self.submit_calls.append(kwargs)
+        run = SimpleNamespace(
+            state=SimpleNamespace(result_state=self.result_state, life_cycle_state="TERMINATED"),
+            tasks=[SimpleNamespace(run_id=999)],
+            run_id=111,
+        )
+        return _FakeWait(run=run)
+
+    def get_run_output(self, run_id: int) -> SimpleNamespace:
+        self.run_output_calls.append(run_id)
+        notebook_output = (
+            SimpleNamespace(result=self.notebook_output)
+            if self.notebook_output is not None
+            else None
+        )
+        return SimpleNamespace(notebook_output=notebook_output, logs=self.logs, error=self.error)
+
+
+@dataclass
+class _FakeConfig:
+    """The one ``WorkspaceClient.config`` attribute the launcher reads."""
+
+    host: str = "https://fake.cloud.databricks.com"
+
+
+@dataclass
+class _FakeWorkspaceClient:
+    """Stands in for ``databricks.sdk.WorkspaceClient``."""
+
+    jobs: _FakeJobs
+    secrets: _FakeSecrets = field(default_factory=_FakeSecrets)
+    workspace: _FakeWorkspace = field(default_factory=_FakeWorkspace)
+    config: _FakeConfig = field(default_factory=_FakeConfig)
+
+    def get_workspace_id(self) -> int:
+        """The org id the driver notebook needs to route to this workspace."""
+        return 1234567890
+
+
+def _install_job_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, jobs: _FakeJobs | None = None
+) -> _FakeWorkspaceClient:
+    """
+    Swap in a fake ``WorkspaceClient`` for ``_run_via_job``'s lazy import.
+
+    :param jobs: A pre-configured `_FakeJobs`, or `None` for a canned
+        successful run.
+    :returns: The fake client backing the launcher's SDK calls.
+    """
+    import databricks.sdk
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _FakeWorkspaceClient(jobs=jobs or _FakeJobs(result_state=RunResultState.SUCCESS))
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_kwargs: fake)
+    return fake
+
+
+def _job_bootstrap_config(**overrides: object) -> JobBootstrapConfig:
+    """A representative `JobBootstrapConfig`, with any field overridden."""
+    defaults: dict[str, object] = {
+        "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
+        "ssh_key_secret_key": "sandbox-gateway-key",
+        "workspace_notebook_path": "/Shared/omnigent/sandbox-job-bootstrap",
+    }
+    defaults.update(overrides)
+    return JobBootstrapConfig(**defaults)  # type: ignore[arg-type]
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_returns_the_tagged_workspace_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On success, the job's captured output carries the workspace path the
+    composed bootstrap script `printf`'d as its last line — `start_host`
+    must parse that tag back out rather than making a second trip into
+    the sandbox to ask for it.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert workspace == "/home/sandbox-agent/workspace"
+    assert fake.jobs.submit_calls  # exactly one job was submitted
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_never_puts_the_token_in_job_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The armed host token must never appear in the `jobs.submit` kwargs —
+    those land verbatim in job run JSON visible to anyone with job-read
+    access. It travels inside the SSH argv, staged as a transient secret
+    instead (asserted separately below).
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="super-secret-armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    submit_kwargs = fake.jobs.submit_calls[0]
+    assert "super-secret-armed-token" not in json.dumps(submit_kwargs, default=str)
+
+
+@pytest.mark.databricks
+def test_job_bootstrap_notebook_never_shells_out_to_the_databricks_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The driver notebook must reach the control plane over REST, never via
+    the `databricks` CLI.
+
+    Not a style preference: the CLI shipped in DBR images is a stub that
+    refuses non-interactive use — ``databricks --version`` exits 1 with
+    "only supported for interactive use from the web terminal ... we
+    recommend using the Databricks Python SDK" — so any argv whose head is
+    `databricks` fails 100% of the time on a job cluster. This asserts the
+    uploaded notebook source is free of it.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    _path, content = fake.workspace.uploads[0]
+    source = content.decode("utf-8")
+    assert "databricks sandbox" not in source
+    assert '"databricks"' not in source
+    # It must instead name the REST surface and invoke ssh itself.
+    assert dbx._LAKEBOX_API_ROOT in source
+    assert '"ssh",' in source
+
+
+@pytest.mark.databricks
+def test_job_bootstrap_notebook_carries_the_workspace_routing_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The notebook is rendered with the workspace host AND org id.
+
+    On classic compute the notebook context's ``apiUrl()`` returns the
+    regional control-plane host rather than the workspace-specific one, so
+    the gateway rejects the credential unless the workspace is named
+    explicitly via ``X-Databricks-Org-Id``. Both values are only knowable
+    launcher-side, so a rendering that drops either is a live-only failure.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    source = fake.workspace.uploads[0][1].decode("utf-8")
+    assert fake.config.host in source
+    assert str(fake.get_workspace_id()) in source
+    assert "X-Databricks-Org-Id" in source
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_stages_the_sandbox_id_with_the_script(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The transient secret carries the sandbox id alongside the script.
+
+    The notebook resolves the gateway host itself (the launcher's process
+    cannot), so it needs to be told WHICH sandbox to resolve — and the
+    sandbox id travels in the secret rather than as a job parameter purely
+    so there is one payload to stage and tear down, not two channels.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-42",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    payload = json.loads(fake.secrets.put_calls[0][2])
+    assert payload["sandbox_id"] == "sb-42"
+    assert "armed-token" in payload["remote_command"]
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_stages_the_argv_as_a_transient_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The token-bearing SSH argv is written to Secrets under the SAME
+    scope the operator registered the sandbox-gateway SSH key in (no
+    second scope to provision), and deleted again once the run reaches a
+    terminal state — bounding the token's exposure window to roughly the
+    job's own runtime rather than leaving it stranded indefinitely.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    config = _job_bootstrap_config()
+    launcher = DatabricksSandboxLauncher(job_bootstrap=config)
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert len(fake.secrets.put_calls) == 1
+    put_scope, put_key, put_value = fake.secrets.put_calls[0]
+    assert put_scope == config.ssh_key_secret_scope
+    assert "armed-token" in put_value  # the argv (bootstrap script) carries it
+    assert fake.secrets.delete_calls == [(put_scope, put_key)]
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_deletes_the_secret_even_on_job_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed run must not strand the transient argv secret — cleanup
+    runs in a `finally`, independent of the run's result.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.FAILED,
+            error="databricks sandbox ssh exited 255",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.start_host(
+            "sb-1",
+            token="armed-token",
+            host_id="host-1",
+            host_name="host-name",
+            server_url="https://omnigent.example.com",
+        )
+
+    assert "exited 255" in str(exc.value)
+    assert len(fake.secrets.delete_calls) == 1
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_raises_when_output_has_no_workspace_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A run that reports success but whose output never carries the
+    workspace tag (e.g. the notebook template drifted from the script)
+    must fail loud rather than return `None`/garbage as the workspace.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(result_state=RunResultState.SUCCESS, notebook_output="launched\n"),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    with pytest.raises(click.ClickException, match="workspace"):
+        launcher.start_host(
+            "sb-1",
+            token="armed-token",
+            host_id="host-1",
+            host_name="host-name",
+            server_url="https://omnigent.example.com",
+        )
+
+
+def test_start_host_without_job_bootstrap_ssh_directly_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `job_bootstrap=None` (the default) must NOT touch the Databricks SDK
+    at all — the direct-SSH path this launcher has always used keeps
+    working unmodified from a laptop that CAN reach the sandbox gateway.
+    """
+    cli = _install(monkeypatch)
+    cli.reply_with("ssh", _Reply(stdout="/home/sandbox-agent"))
+    launcher = DatabricksSandboxLauncher()
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert cli.argvs("ssh")  # base start_host's own probe/launch calls ran
+
+
+def test_compose_bootstrap_script_runs_the_dev_bootstrap_command_first() -> None:
+    """
+    `bootstrap_command` (the dev-only self-update hook) must still run on
+    the job-delegated path, in the same position it runs on direct SSH —
+    before workspace setup, on every host start.
+    """
+    launcher = DatabricksSandboxLauncher(
+        bootstrap_command="git -C ~/omnigent pull",
+        job_bootstrap=_job_bootstrap_config(),
+    )
+    script = launcher._compose_bootstrap_script(
+        token="tok",
+        host_id="hid",
+        host_name="hname",
+        server_url="https://omnigent.example.com",
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        host_config=None,
+    )
+    lines = script.splitlines()
+    assert lines.index("git -C ~/omnigent pull") < lines.index('home="$(printf %s "$HOME")"')
+
+
+def test_compose_bootstrap_script_clones_only_when_repo_url_given() -> None:
+    """
+    No `repo_url` means no clone step — the sandbox image's own checkout
+    (or a resumed sandbox's existing one) is used as-is.
+    """
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+    script = launcher._compose_bootstrap_script(
+        token="tok",
+        host_id="hid",
+        host_name="hname",
+        server_url="https://omnigent.example.com",
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        host_config=None,
+    )
+    assert "git clone" not in script
+
+    cloning_script = launcher._compose_bootstrap_script(
+        token="tok",
+        host_id="hid",
+        host_name="hname",
+        server_url="https://omnigent.example.com",
+        repo_url="https://github.com/example/repo.git",
+        repo_branch="main",
+        repo_name="repo",
+        host_config=None,
+    )
+    assert "git clone --branch main --single-branch -- " in cloning_script
+    assert "https://github.com/example/repo.git" in cloning_script
+
+
+def test_compose_bootstrap_script_ends_with_the_workspace_tag() -> None:
+    """
+    The last line must `printf` the workspace tag — `_run_via_job`'s
+    caller parses exactly this to recover `start_host`'s return value.
+    """
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+    script = launcher._compose_bootstrap_script(
+        token="tok",
+        host_id="hid",
+        host_name="hname",
+        server_url="https://omnigent.example.com",
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        host_config=None,
+    )
+    assert script.splitlines()[-1] == f'printf "{dbx._WORKSPACE_TAG}%s\\n" "$workspace"'

@@ -162,6 +162,7 @@ from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.onboarding.sandboxes.databricks_sandbox import JobBootstrapConfig
     from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -944,7 +945,14 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         if databricks_section is not None:
             _reject_unknown_keys(
                 databricks_section,
-                {"cli_path", "profile", "idle_timeout", "no_autostop", "bootstrap_command"},
+                {
+                    "cli_path",
+                    "profile",
+                    "idle_timeout",
+                    "no_autostop",
+                    "bootstrap_command",
+                    "job_bootstrap",
+                },
                 "sandbox.databricks",
             )
         no_autostop = _parse_provider_bool(raw, "databricks", "no_autostop")
@@ -954,6 +962,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             idle_timeout=_parse_provider_string(raw, "databricks", "idle_timeout"),
             no_autostop=True if no_autostop is None else no_autostop,
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
+            job_bootstrap=_parse_databricks_job_bootstrap(databricks_section),
         )
         token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
@@ -1695,6 +1704,96 @@ def _islo_launcher_factory(
     return _build
 
 
+def _parse_databricks_job_bootstrap(
+    section: dict[str, object] | None,
+) -> JobBootstrapConfig | None:
+    """
+    Build the job-bootstrap config from ``sandbox.databricks.job_bootstrap``.
+
+    Required when the block is present, because there is no sensible default
+    for either: *ssh_key_secret_scope* / *ssh_key_secret_key* name the
+    operator-registered gateway key, and *workspace_notebook_path* names a
+    path the launcher overwrites on every run — guessing at that would let a
+    typo clobber someone's notebook.
+
+    :param section: The ``sandbox.databricks`` mapping, or ``None`` when the
+        provider block is omitted entirely.
+    :returns: The parsed config, or ``None`` when ``job_bootstrap`` is absent
+        (the launcher then bootstraps over direct SSH, which only works from
+        a host that can route to the sandbox gateway).
+    :raises ValueError: When the block is malformed, or a required field is
+        missing or not a non-empty string.
+    """
+    if section is None:
+        return None
+    block = section.get("job_bootstrap")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise ValueError("server config 'sandbox.databricks.job_bootstrap' must be a mapping")
+    _reject_unknown_keys(
+        block,
+        {
+            "ssh_key_secret_scope",
+            "ssh_key_secret_key",
+            "workspace_notebook_path",
+            "node_type_id",
+            "spark_version",
+            "timeout_s",
+        },
+        "sandbox.databricks.job_bootstrap",
+    )
+
+    def _required(key: str) -> str:
+        """Read a required non-empty string field out of the block."""
+        value = block.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"server config 'sandbox.databricks.job_bootstrap.{key}' "
+                "must be a non-empty string"
+            )
+        return value.strip()
+
+    def _optional(key: str) -> str | None:
+        """Read an optional non-empty string field out of the block."""
+        value = block.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"server config 'sandbox.databricks.job_bootstrap.{key}' "
+                "must be a non-empty string"
+            )
+        return value.strip()
+
+    from omnigent.onboarding.sandboxes.databricks_sandbox import JobBootstrapConfig
+
+    overrides: dict[str, object] = {}
+    for key in ("node_type_id", "spark_version"):
+        value = _optional(key)
+        if value is not None:
+            overrides[key] = value
+    timeout_s = block.get("timeout_s")
+    if timeout_s is not None:
+        if (
+            not isinstance(timeout_s, (int, float))
+            or isinstance(timeout_s, bool)
+            or timeout_s <= 0
+        ):
+            raise ValueError(
+                "server config 'sandbox.databricks.job_bootstrap.timeout_s' "
+                "must be a positive number"
+            )
+        overrides["timeout_s"] = float(timeout_s)
+
+    return JobBootstrapConfig(
+        ssh_key_secret_scope=_required("ssh_key_secret_scope"),
+        ssh_key_secret_key=_required("ssh_key_secret_key"),
+        workspace_notebook_path=_required("workspace_notebook_path"),
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
 def _databricks_launcher_factory(
     *,
     cli_path: str | None,
@@ -1702,6 +1801,7 @@ def _databricks_launcher_factory(
     idle_timeout: str | None,
     no_autostop: bool,
     bootstrap_command: str | None = None,
+    job_bootstrap: JobBootstrapConfig | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: databricks`` path.
@@ -1718,6 +1818,10 @@ def _databricks_launcher_factory(
     :param no_autostop: Whether provisioned sandboxes are exempt from
         idle auto-stop. Defaults to ``True`` at the parse site, since a
         managed host must survive idle gaps between turns.
+    :param job_bootstrap: Config routing the one-time SSH bootstrap through
+        a classic-compute Databricks Job, or ``None`` to SSH directly.
+        Required when the server runs as a Databricks App, whose container
+        cannot reach the sandbox gateway on 2222.
     :returns: A factory producing parameterized Databricks launchers.
     """
 
@@ -1731,6 +1835,7 @@ def _databricks_launcher_factory(
             idle_timeout=idle_timeout,
             no_autostop=no_autostop,
             bootstrap_command=bootstrap_command,
+            job_bootstrap=job_bootstrap,
         )
 
     return _build

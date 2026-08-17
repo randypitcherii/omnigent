@@ -63,8 +63,10 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
@@ -74,6 +76,8 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxLauncher,
+    render_host_config_write_command,
+    supervise_host_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
@@ -172,6 +176,219 @@ _STOPPED_STATUSES: frozenset[str] = frozenset({"stopped", "stopping", "starting"
 # exist". Matched case-insensitively against combined output so a delete
 # of an already-gone sandbox is idempotent.
 _NOT_FOUND_MARKERS: tuple[str, ...] = ("not found", "does not exist", "no such sandbox")
+
+# Line the composed bootstrap script prints as its last stdout line, so the
+# job-run output (fetched after the run reaches a terminal state) can be
+# parsed back into the workspace path `start_host` must return, without a
+# second round trip into the sandbox to ask for it again.
+_WORKSPACE_TAG: str = "OMNIGENT_JOB_BOOTSTRAP_WORKSPACE="
+
+# Ceiling on classic-compute job-run completion: cold single-node cluster
+# spin-up dominates (observed 3-6 minutes), then the bootstrap script itself
+# (clone + host launch) is seconds. Generous enough to cover a slow cluster
+# start without letting a wedged run hang a managed launch indefinitely.
+_JOB_BOOTSTRAP_TIMEOUT_S: float = 900.0
+
+# Sandbox control-plane REST surface, as used by the bootstrap notebook.
+# Mirrors `cmd/sandbox/api.go` in the Databricks CLI, whose `sandboxAPIRoot`
+# still says "lakebox" because the server-side rename is pending.
+_LAKEBOX_API_ROOT: str = "/api/2.0/lakebox"
+
+# Port the sandbox SSH gateway listens on (CLI: `defaultGatewayPort`).
+_SANDBOX_GATEWAY_PORT: str = "2222"
+
+# Driver notebook staged (and overwritten on every submission) at
+# `JobBootstrapConfig.workspace_notebook_path`. Runs on the classic-compute
+# cluster and deliberately does NOT shell out to the `databricks` CLI: the
+# CLI shipped in DBR images is a stub that refuses non-interactive use
+# ("only supported for interactive use from the web terminal ... we
+# recommend using the Databricks Python SDK", exit 1), so the CLI's
+# `sandbox ssh` behavior is reproduced here directly — resolve the gateway
+# and start the sandbox over REST, then exec `ssh` with the argv shape from
+# the CLI's `buildSSHArgs`.
+#
+# Both secrets it needs go through `dbutils.secrets.get`, which Databricks
+# redacts from notebook output and logs automatically: the SSH private key
+# (long-lived, operator-registered) and the connect payload (transient,
+# holding the remote script — which embeds the armed host token, so it must
+# never reach the job run JSON).
+_JOB_BOOTSTRAP_NOTEBOOK_TEMPLATE: str = '''# Databricks notebook source
+import json
+import os
+import stat
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+API_ROOT = "{api_root}"
+GATEWAY_PORT = "{gateway_port}"
+
+# Notebook-context credentials rather than a PAT in a secret: this token is
+# ephemeral, scoped to the run, and never leaves the driver.
+_ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+_token = _ctx.apiToken().get()
+
+# On classic compute `apiUrl()` returns the REGIONAL control-plane host, not
+# the workspace-specific one, so the workspace must be named explicitly via
+# the org-id header or the gateway rejects the credential as "not sent or of
+# an unsupported type for this API" (CLI: `orgIDHeader`).
+_host = "{workspace_host}".rstrip("/")
+_org_id = "{workspace_id}"
+
+
+def api(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(_host + path, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + _token)
+    req.add_header("Content-Type", "application/json")
+    if _org_id:
+        req.add_header("X-Databricks-Org-Id", _org_id)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(
+            f"{{method}} {{path}} failed: HTTP {{exc.code}} {{detail}}"
+        ) from None
+    return json.loads(raw) if raw.strip() else {{}}
+
+
+# --- SSH identity -----------------------------------------------------
+# Private key only: unlike the CLI, nothing here pre-verifies registration
+# against `<key>.pub`, so no public half is needed on the cluster.
+key_material = dbutils.secrets.get(scope="{ssh_key_scope}", key="{ssh_key_key}")
+key_path = os.path.expanduser("~/.ssh/sandbox_ed25519")
+os.makedirs(os.path.dirname(key_path), exist_ok=True)
+with open(key_path, "w") as fh:
+    fh.write(key_material)
+    if not key_material.endswith("\\n"):
+        fh.write("\\n")
+os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+
+payload = json.loads(dbutils.secrets.get(scope="{argv_scope}", key="{argv_key}"))
+sandbox_id = payload["sandbox_id"]
+remote_command = payload["remote_command"]
+
+# --- Resolve the gateway, and start the sandbox if it is not up -------
+sandbox_path = API_ROOT + "/sandboxes/" + sandbox_id
+sandbox = api("GET", sandbox_path)
+if str(sandbox.get("status", "")).lower() != "running":
+    api("POST", sandbox_path + "/start")
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        sandbox = api("GET", sandbox_path)
+        if str(sandbox.get("status", "")).lower() == "running":
+            break
+        time.sleep(5)
+    else:
+        raise RuntimeError(
+            f"sandbox {{sandbox_id}} did not reach running: {{sandbox.get('status')}}"
+        )
+
+gateway_host = sandbox.get("gatewayHost") or ""
+if not gateway_host:
+    raise RuntimeError(f"sandbox {{sandbox_id}} reported no gatewayHost")
+
+# --- The one SSH call -------------------------------------------------
+# argv mirrors the CLI's `buildSSHArgs` single-extra-arg path: the remote
+# command is handed through untouched for the remote shell to parse.
+# `BatchMode=yes` is the one addition — the CLI assumes a human at a
+# terminal, and in a job any auth prompt would hang until the run timeout
+# instead of failing fast.
+argv = [
+    "ssh",
+    "-i", key_path,
+    "-p", GATEWAY_PORT,
+    "-o", "IdentitiesOnly=yes",
+    "-o", "PreferredAuthentications=publickey",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "BatchMode=yes",
+    f"{{sandbox_id}}@{{gateway_host}}",
+    remote_command,
+]
+completed = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+if completed.returncode != 0:
+    raise RuntimeError(
+        f"ssh to sandbox {{sandbox_id}} exited {{completed.returncode}}: "
+        f"{{completed.stderr.strip()}}"
+    )
+# `dbutils.notebook.exit` (not `print`) is the reliable channel back to the
+# caller: it lands in `run-output.notebook_output.result` deterministically,
+# where plain stdout capture depends on cluster log-delivery configuration.
+dbutils.notebook.exit(completed.stdout)
+'''
+
+
+@dataclass(frozen=True)
+class JobBootstrapConfig:
+    """
+    Delegate the one-time SSH bootstrap to a classic-compute Databricks Job.
+
+    Exists because a Databricks App container cannot route to the sandbox's
+    SSH gateway on port 2222: inside the container the gateway name resolves
+    to a private-link address (``192.168.200.10``) that only answers on 443.
+    **Classic compute is the specific escape hatch, and it is not
+    interchangeable with serverless** — measured from a serverless job the
+    gateway resolves to that same private address and port 2222 returns "no
+    route to host", exactly as in the App. Only classic compute resolves the
+    gateway to its public addresses and completes an SSH handshake, so the
+    throwaway single-node cluster below is load-bearing, not incidental.
+
+    Egress there is selectively permitted rather than open (``github.com:22``
+    and the PyPI mirror both time out from the same cluster); what this needs
+    — the sandbox gateway on 2222 — is reachable.
+
+    When set on :class:`DatabricksSandboxLauncher`, ``start_host`` composes
+    every remote step it would normally run itself (probe ``$HOME``,
+    ``mkdir``, clone, write host config, launch ``omnigent host``) into ONE
+    script and submits ONE job run that opens a single SSH session to run it
+    — one job-run round trip, not one per step. The job pays a cold
+    single-node cluster start (observed 3-6 minutes) on every managed launch;
+    that latency is the price of the routing gap.
+
+    Both secrets this needs (the armed host token and an SSH private key
+    registered against the sandbox gateway) travel through Databricks
+    Secrets rather than job parameters or cluster env vars, which land
+    verbatim in job run JSON visible to anyone with job-read access.
+    :attr:`ssh_key_secret_scope` / :attr:`ssh_key_secret_key` name a
+    long-lived secret an operator registers out of band (``databricks
+    sandbox register`` run once against a throwaway machine, then the
+    resulting ``~/.ssh/sandbox_ed25519`` content pasted into the secret) —
+    see the module docstring's job-bootstrap section for why this is a
+    deliberate tradeoff, not an oversight.
+    """
+
+    ssh_key_secret_scope: str
+    """Databricks Secrets scope holding the sandbox gateway's registered SSH
+    private key, e.g. ``"omnigent-sandbox-bootstrap"``."""
+
+    ssh_key_secret_key: str
+    """Key within *ssh_key_secret_scope* holding the private key content
+    (OpenSSH format, as written by ``databricks sandbox register``)."""
+
+    workspace_notebook_path: str
+    """Workspace path the launcher (over)writes with the one-shot bootstrap
+    notebook before every job submission, e.g.
+    ``"/Shared/omnigent/sandbox-job-bootstrap"``. Reused across runs — the
+    notebook is a fixed driver script; only the connect payload it reads
+    from a transient secret varies."""
+
+    node_type_id: str = "m5d.large"
+    """Classic-compute node type for the throwaway single-node cluster.
+    Instance-store-backed on purpose: EBS-only families (``m4.large``) are
+    rejected outright — "At least one EBS volume must be attached for
+    clusters created with node type m4.large" — unless the cluster spec also
+    declares EBS volumes, which this deliberately does not."""
+
+    spark_version: str = "15.4.x-scala2.12"
+    """Databricks Runtime version for the throwaway cluster."""
+
+    timeout_s: float = _JOB_BOOTSTRAP_TIMEOUT_S
+    """Ceiling on job-run completion, dominated by cluster spin-up."""
 
 
 def _drain_forward_output(
@@ -355,6 +572,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         idle_timeout: str | None = None,
         no_autostop: bool = True,
         bootstrap_command: str | None = None,
+        job_bootstrap: JobBootstrapConfig | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -374,12 +592,19 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             auto-stop. Defaults to ``True`` because a managed host must
             survive arbitrary idle gaps between turns; set ``False`` to
             let *idle_timeout* (or the workspace default) apply.
+        :param job_bootstrap: When set, ``start_host`` delegates the
+            entire one-time SSH bootstrap to a classic-compute Databricks
+            Job instead of exec'ing directly — see
+            :class:`JobBootstrapConfig`. ``None`` (the default) preserves
+            direct SSH exactly, so this launcher keeps working unmodified
+            from a laptop that CAN reach the sandbox gateway.
         """
         self._cli_path = cli_path or DEFAULT_CLI_BINARY
         self._profile = profile
         self._idle_timeout = idle_timeout
         self._no_autostop = no_autostop
         self._bootstrap_command = bootstrap_command
+        self._job_bootstrap = job_bootstrap
 
     def start_host(self, sandbox_id: str, **kwargs):  # type: ignore[override]
         """Run the configured bootstrap, then start the host as usual.
@@ -389,10 +614,240 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         operator-supplied command (typically a self-update from git)
         runs on every host start — fresh provisions AND resumes — so a
         revived sandbox is refreshed before ``omnigent host`` launches.
+
+        When ``job_bootstrap`` is configured, none of this launcher's own
+        exec methods touch the sandbox at all: the whole sequence below
+        (bootstrap command, workspace setup, host launch) is composed into
+        one script and handed to a classic-compute job to run over SSH,
+        because THIS process (typically inside a Databricks App) cannot
+        reach the sandbox gateway on port 2222.
         """
+        if self._job_bootstrap is not None:
+            return self._start_host_via_job(sandbox_id, self._job_bootstrap, **kwargs)
         if self._bootstrap_command:
             self.run(sandbox_id, self._bootstrap_command)
         return super().start_host(sandbox_id, **kwargs)
+
+    # ── Job-delegated bootstrap ─────────────────────────
+
+    def _compose_bootstrap_script(
+        self,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None,
+        repo_branch: str | None,
+        repo_name: str | None,
+        host_config: dict[str, object] | None,
+    ) -> str:
+        """
+        Fold every step of the default ``start_host`` bootstrap into ONE
+        POSIX ``sh`` script, so the job-delegated path costs one
+        ``databricks sandbox ssh`` call (and therefore one job run) instead
+        of one per step. Mirrors
+        :meth:`~omnigent.onboarding.sandboxes.base.ExecModelHostLauncher.start_host`
+        step for step — probe ``$HOME``, ``mkdir`` the workspace, clone if a
+        repo was given, write host config, launch the supervised host in
+        the background — plus this provider's own
+        ``bootstrap_command`` hook up front, exactly where :meth:`start_host`
+        runs it on the direct-SSH path.
+
+        The resolved workspace path is ``printf``'d as the script's last
+        line, tagged with :data:`_WORKSPACE_TAG`, so the caller can recover
+        :meth:`start_host`'s return value from the job's captured output
+        without a second trip into the sandbox.
+        """
+        lines: list[str] = ["set -eu"]
+        if self._bootstrap_command:
+            lines.append(self._bootstrap_command)
+        lines.append('home="$(printf %s "$HOME")"')
+        lines.append('workspace="$home/workspace"')
+        lines.append('mkdir -p "$workspace"')
+        if repo_url is not None:
+            clone_dir_expr = f'"$workspace"/{shlex.quote(repo_name or "repo")}'
+            branch_args = (
+                f"--branch {shlex.quote(repo_branch)} --single-branch " if repo_branch else ""
+            )
+            lines.append(
+                f"git clone {branch_args}-- {shlex.quote(repo_url)} {clone_dir_expr}"
+            )
+            lines.append(f'workspace={clone_dir_expr}')
+        if host_config is not None:
+            lines.append(render_host_config_write_command(host_config))
+        env_prefix = " ".join(
+            f"{key}={shlex.quote(value)}"
+            for key, value in (
+                ("OMNIGENT_HOST_TOKEN", token),
+                ("OMNIGENT_HOST_ID", host_id),
+                ("OMNIGENT_HOST_NAME", host_name),
+            )
+        )
+        host_command = f"{env_prefix} omnigent host --server {shlex.quote(server_url)}"
+        supervised = supervise_host_command(host_command)
+        lines.append(
+            f"setsid nohup sh -c {shlex.quote(supervised)} "
+            "> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
+        )
+        lines.append(f'printf "{_WORKSPACE_TAG}%s\\n" "$workspace"')
+        return "\n".join(lines)
+
+    def _start_host_via_job(
+        self,
+        sandbox_id: str,
+        job_bootstrap: JobBootstrapConfig,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        host_config: dict[str, object] | None = None,
+        on_stage: object | None = None,
+    ) -> str:
+        """
+        Run the composed bootstrap script via a one-shot classic-compute Job.
+
+        See :class:`JobBootstrapConfig` for why: this process cannot reach
+        the sandbox gateway on port 2222, and classic compute can. The job's
+        single task drops the SSH private key from Databricks Secrets,
+        resolves the gateway over REST, and opens exactly one SSH session
+        that runs the whole script — one job run, one SSH session,
+        regardless of how many bootstrap steps the script contains.
+
+        :raises click.ClickException: If the job run fails, times out, or
+            its output does not carry the expected workspace-path tag.
+        """
+        if on_stage is not None and callable(on_stage):
+            on_stage("starting")
+        script = self._compose_bootstrap_script(
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+        )
+        output = self._run_via_job(job_bootstrap, sandbox_id, script)
+        for line in output.splitlines():
+            if line.startswith(_WORKSPACE_TAG):
+                return line[len(_WORKSPACE_TAG) :].strip()
+        raise click.ClickException(
+            f"job-delegated bootstrap for Databricks Sandbox '{sandbox_id}' completed "
+            f"but its output did not include the expected {_WORKSPACE_TAG!r} tag — "
+            f"cannot report the workspace path. Output: {output!r}"
+        )
+
+    def _run_via_job(
+        self, job_bootstrap: JobBootstrapConfig, sandbox_id: str, remote_command: str
+    ) -> str:
+        """
+        Submit and await the one-shot job that SSHes into *sandbox_id* on classic compute.
+
+        The armed host token lives inside *remote_command* (folded into the
+        bootstrap script by :meth:`_compose_bootstrap_script`), so it is
+        never passed as a job parameter or cluster env var — both land
+        verbatim in job run JSON visible to anyone with job-read access.
+        Instead the connect payload is staged as a **transient** Databricks
+        Secret, created immediately before submission and deleted in a
+        ``finally`` block once the run reaches a terminal state. This is a
+        deliberate tradeoff, not a closed problem: the secret is readable by
+        anyone with read access to the workspace's default scope for the
+        run's lifetime (minutes), and a crash between "job submitted" and
+        "job reached terminal state" leaves it stranded until the next
+        cleanup pass — see the module docstring's job-bootstrap section.
+
+        The SSH private key registered against the sandbox gateway
+        (*job_bootstrap.ssh_key_secret_scope* / ``ssh_key_secret_key``) is
+        NOT staged here — it is a long-lived secret an operator registers
+        out of band once, so the job cluster can read it directly via
+        ``dbutils.secrets.get``, which Databricks redacts from notebook
+        output automatically (unlike a job parameter or cluster env var).
+
+        :returns: The job task's captured stdout.
+        :raises click.ClickException: On job failure, timeout, or missing output.
+        """
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.compute import ClusterSpec
+        from databricks.sdk.service.jobs import NotebookTask, RunResultState, SubmitTask
+
+        client = WorkspaceClient(profile=self._profile) if self._profile else WorkspaceClient()
+        argv_secret_key = f"job-bootstrap-argv-{uuid.uuid4().hex}"
+        client.secrets.put_secret(
+            scope=job_bootstrap.ssh_key_secret_scope,
+            key=argv_secret_key,
+            string_value=json.dumps(
+                {"sandbox_id": sandbox_id, "remote_command": remote_command}
+            ),
+        )
+        # The notebook cannot discover these itself: on classic compute
+        # `apiUrl()` yields the regional control-plane host, which needs the
+        # workspace's org id alongside it to route. Both are known here.
+        notebook_source = _JOB_BOOTSTRAP_NOTEBOOK_TEMPLATE.format(
+            ssh_key_scope=job_bootstrap.ssh_key_secret_scope,
+            ssh_key_key=job_bootstrap.ssh_key_secret_key,
+            argv_scope=job_bootstrap.ssh_key_secret_scope,
+            argv_key=argv_secret_key,
+            api_root=_LAKEBOX_API_ROOT,
+            gateway_port=_SANDBOX_GATEWAY_PORT,
+            workspace_host=client.config.host,
+            workspace_id=client.get_workspace_id(),
+        )
+        client.workspace.upload(
+            job_bootstrap.workspace_notebook_path,
+            content=notebook_source.encode("utf-8"),
+            overwrite=True,
+        )
+        run = None
+        try:
+            waiter = client.jobs.submit(
+                run_name="omnigent-sandbox-job-bootstrap",
+                tasks=[
+                    SubmitTask(
+                        task_key="bootstrap",
+                        notebook_task=NotebookTask(
+                            notebook_path=job_bootstrap.workspace_notebook_path
+                        ),
+                        new_cluster=ClusterSpec(
+                            spark_version=job_bootstrap.spark_version,
+                            node_type_id=job_bootstrap.node_type_id,
+                            num_workers=0,
+                            spark_conf={
+                                "spark.master": "local[*]",
+                                "spark.databricks.cluster.profile": "singleNode",
+                            },
+                            custom_tags={"ResourceClass": "SingleNode"},
+                        ),
+                    )
+                ],
+                timeout_seconds=int(job_bootstrap.timeout_s),
+            )
+            run = waiter.result()
+        finally:
+            client.secrets.delete_secret(scope=job_bootstrap.ssh_key_secret_scope, key=argv_secret_key)
+        state = run.state
+        task_run_id = run.tasks[0].run_id if run.tasks else run.run_id
+        run_output = client.jobs.get_run_output(task_run_id)
+        notebook_result = (
+            run_output.notebook_output.result
+            if run_output.notebook_output is not None
+            else None
+        )
+        combined_output = "\n".join(
+            part for part in (notebook_result, run_output.logs, run_output.error) if part
+        )
+        if state is None or state.result_state != RunResultState.SUCCESS:
+            raise click.ClickException(
+                "job-delegated Databricks Sandbox bootstrap failed "
+                f"(life_cycle_state={getattr(state, 'life_cycle_state', None)}, "
+                f"result_state={getattr(state, 'result_state', None)}): {combined_output}"
+            )
+        return combined_output
 
     # ── CLI plumbing ────────────────────────────────────
 

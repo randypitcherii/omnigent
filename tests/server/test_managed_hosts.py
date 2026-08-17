@@ -1514,6 +1514,111 @@ def test_parse_invalid_config_fails_loud(raw: object, expected_fragment: str) ->
     assert expected_fragment in str(exc.value)
 
 
+def test_parse_databricks_job_bootstrap_reaches_the_launcher() -> None:
+    """
+    ``sandbox.databricks.job_bootstrap`` is the only way an operator can
+    switch on the classic-compute bootstrap path, so it has to survive YAML
+    parsing intact — a Databricks App deployment cannot reach the sandbox
+    SSH gateway without it.
+    """
+    from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://s.example.com",
+            "databricks": {
+                "profile": "fe-vm",
+                "job_bootstrap": {
+                    "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
+                    "ssh_key_secret_key": "sandbox-ssh-private-key",
+                    "workspace_notebook_path": "/Users/me/omnigent/bootstrap",
+                    "node_type_id": "m5d.xlarge",
+                    "timeout_s": 900,
+                },
+            },
+        }
+    )
+
+    assert cfg is not None
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, DatabricksSandboxLauncher)
+    bootstrap = launcher._job_bootstrap
+    assert bootstrap is not None
+    assert bootstrap.ssh_key_secret_scope == "omnigent-sandbox-bootstrap"
+    assert bootstrap.ssh_key_secret_key == "sandbox-ssh-private-key"
+    assert bootstrap.workspace_notebook_path == "/Users/me/omnigent/bootstrap"
+    assert bootstrap.node_type_id == "m5d.xlarge"
+    assert bootstrap.timeout_s == 900.0
+
+
+def test_parse_databricks_without_job_bootstrap_leaves_direct_ssh() -> None:
+    """Omitting the block keeps the direct-SSH path, for a server that can
+    actually route to the gateway (a laptop, not an App container)."""
+    from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+
+    cfg = parse_sandbox_config({"provider": "databricks", "server_url": "https://s.example.com"})
+
+    assert cfg is not None
+    launcher = cfg.launcher_factory()
+    assert isinstance(launcher, DatabricksSandboxLauncher)
+    assert launcher._job_bootstrap is None
+
+
+@pytest.mark.parametrize(
+    ("block", "expected_fragment"),
+    [
+        # A missing required field would otherwise surface as a TypeError
+        # deep inside the launcher on the first managed launch.
+        (
+            {"ssh_key_secret_key": "k", "workspace_notebook_path": "/p"},
+            "job_bootstrap.ssh_key_secret_scope",
+        ),
+        (
+            {"ssh_key_secret_scope": "s", "workspace_notebook_path": "/p"},
+            "job_bootstrap.ssh_key_secret_key",
+        ),
+        (
+            {"ssh_key_secret_scope": "s", "ssh_key_secret_key": "k"},
+            "job_bootstrap.workspace_notebook_path",
+        ),
+        # A typo here would silently fall back to the wrong node family or
+        # timeout, so unknown keys are rejected outright.
+        (
+            {
+                "ssh_key_secret_scope": "s",
+                "ssh_key_secret_key": "k",
+                "workspace_notebook_path": "/p",
+                "node_typ_id": "m5d.large",
+            },
+            "unknown key(s): node_typ_id",
+        ),
+        (
+            {
+                "ssh_key_secret_scope": "s",
+                "ssh_key_secret_key": "k",
+                "workspace_notebook_path": "/p",
+                "timeout_s": 0,
+            },
+            "job_bootstrap.timeout_s",
+        ),
+    ],
+)
+def test_parse_databricks_job_bootstrap_fails_loud(
+    block: dict[str, object], expected_fragment: str
+) -> None:
+    """A malformed block must stop server startup, not the first launch."""
+    with pytest.raises(ValueError) as exc:
+        parse_sandbox_config(
+            {
+                "provider": "databricks",
+                "server_url": "https://s.example.com",
+                "databricks": {"job_bootstrap": block},
+            }
+        )
+    assert expected_fragment in str(exc.value)
+
+
 # ── parse_repo_workspace ────────────────────────────────────
 
 
