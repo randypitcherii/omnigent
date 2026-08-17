@@ -746,9 +746,12 @@ def test_wheel_install_command_quotes_the_tarball_path() -> None:
 # A Databricks App container cannot reach the sandbox SSH gateway on port
 # 2222 (private-link stub, only 443 routes there), so `JobBootstrapConfig`
 # delegates the one-time bootstrap SSH session to a classic-compute job,
-# whose allow-all egress baseline CAN reach it (verified live: a classic
-# job got a real SSH banner back on 2222; a serverless job got the same
-# "no route to host" the App container reports).
+# which CAN reach it (verified live: on classic compute the gateway name
+# resolves to a PUBLIC regional address and 2222 returns a real SSH
+# banner; on both a serverless job and the App container it resolves to a
+# private address that answers only on 443). Classic egress is selective,
+# not allow-all -- `github.com:22` and the PyPI mirror both time out
+# there -- so the notebook must not assume general internet access.
 #
 # `_run_via_job` imports `databricks.sdk` lazily inside the method it
 # backs (an optional extra, per the module docstring), so these fakes are
@@ -776,12 +779,16 @@ class _FakeSecrets:
 
 @dataclass
 class _FakeWorkspace:
-    """Records every ``workspace.upload`` call (the driver notebook)."""
+    """Records ``workspace.upload`` / ``delete`` (the driver notebook)."""
 
     uploads: list[tuple[str, bytes]] = field(default_factory=list)
+    deletes: list[str] = field(default_factory=list)
 
     def upload(self, path: str, *, content: bytes, overwrite: bool = True) -> None:
         self.uploads.append((path, content))
+
+    def delete(self, path: str) -> None:
+        self.deletes.append(path)
 
 
 @dataclass
@@ -1133,6 +1140,101 @@ def test_start_host_via_job_deletes_the_secret_even_on_job_failure(
 
     assert "exited 255" in str(exc.value)
     assert len(fake.secrets.delete_calls) == 1
+
+
+def _launch(launcher: DatabricksSandboxLauncher, sandbox_id: str, token: str) -> None:
+    """Drive one job-delegated `start_host`, ignoring the returned path."""
+    launcher.start_host(
+        sandbox_id,
+        token=token,
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_uses_a_per_run_notebook_path_and_removes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Each run uploads its driver notebook to a path derived from the
+    configured base plus a fresh suffix, and deletes it afterwards.
+
+    A single fixed path would be a correctness bug, not untidiness: two
+    concurrent launches would race between upload and run, and the loser
+    would execute the winner's notebook — pointed at the winner's payload
+    secret, and therefore at the wrong sandbox.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    config = _job_bootstrap_config()
+    launcher = DatabricksSandboxLauncher(job_bootstrap=config)
+
+    _launch(launcher, "sb-1", "armed-token")
+    _launch(launcher, "sb-2", "armed-token")
+
+    paths = [path for path, _content in fake.workspace.uploads]
+    assert len(paths) == 2
+    assert len(set(paths)) == 2, "two launches shared one notebook path"
+    for path in paths:
+        assert path.startswith(f"{config.workspace_notebook_path}-")
+    # Nothing token-bearing may outlive the run: both the notebook and the
+    # payload secret are removed, and the job ran the path just uploaded.
+    assert fake.workspace.deletes == paths
+    assert [key for _scope, key in fake.secrets.delete_calls] == [
+        key for _scope, key, _value in fake.secrets.put_calls
+    ]
+    submitted = [
+        task.notebook_task.notebook_path
+        for kwargs in fake.jobs.submit_calls
+        for task in kwargs["tasks"]
+    ]
+    assert submitted == paths
+
+
+@pytest.mark.databricks
+def test_job_bootstrap_notebook_scrubs_the_armed_token_from_its_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The armed host token must not survive into the notebook's output.
+
+    `dbutils.secrets.get` is redacted by Databricks automatically, but the
+    remote command's OWN stdout/stderr is not, and both
+    `dbutils.notebook.exit` and an uncaught exception message land in
+    durable job-run JSON readable by anyone with job-read access. The
+    caller therefore names the token in the payload's `redact` list, and
+    the notebook scrubs every output path with it.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    _launch(launcher, "sb-1", "super-secret-armed-token")
+
+    _scope, _key, put_value = fake.secrets.put_calls[0]
+    assert json.loads(put_value)["redact"] == ["super-secret-armed-token"]
+    notebook = fake.workspace.uploads[0][1].decode()
+    # Both exits — the failure path and the success path — go through the
+    # scrubber, so neither can carry the token out of the run.
+    assert "raise RuntimeError(" in notebook
+    assert "scrub(completed.stderr.strip())" in notebook
+    assert "dbutils.notebook.exit(scrub(completed.stdout))" in notebook
 
 
 @pytest.mark.databricks

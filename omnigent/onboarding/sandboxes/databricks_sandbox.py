@@ -58,13 +58,14 @@ Platform notes that shape this launcher:
 from __future__ import annotations
 
 import json
+import logging
 import shlex
 import shutil
 import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,6 +81,8 @@ from omnigent.onboarding.sandboxes.base import (
     supervise_host_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────
 
@@ -270,6 +273,20 @@ os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
 payload = json.loads(dbutils.secrets.get(scope="{argv_scope}", key="{argv_key}"))
 sandbox_id = payload["sandbox_id"]
 remote_command = payload["remote_command"]
+# Anything the caller marks secret (the armed host token) must not survive
+# into this notebook's output. `dbutils.secrets.get` is redacted by
+# Databricks automatically, but the remote command's OWN stdout/stderr is
+# not, and both `dbutils.notebook.exit` and an exception message land in
+# durable job-run JSON that anyone with job-read access can read.
+redact = [str(value) for value in payload.get("redact", []) if value]
+
+
+def scrub(text):
+    """Replace every secret in *text* before it can reach job-run output."""
+    for secret in redact:
+        text = text.replace(secret, "***")
+    return text
+
 
 # --- Resolve the gateway, and start the sandbox if it is not up -------
 sandbox_path = API_ROOT + "/sandboxes/" + sandbox_id
@@ -314,12 +331,12 @@ completed = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
 if completed.returncode != 0:
     raise RuntimeError(
         f"ssh to sandbox {{sandbox_id}} exited {{completed.returncode}}: "
-        f"{{completed.stderr.strip()}}"
+        f"{{scrub(completed.stderr.strip())}}"
     )
 # `dbutils.notebook.exit` (not `print`) is the reliable channel back to the
 # caller: it lands in `run-output.notebook_output.result` deterministically,
 # where plain stdout capture depends on cluster log-delivery configuration.
-dbutils.notebook.exit(completed.stdout)
+dbutils.notebook.exit(scrub(completed.stdout))
 '''
 
 
@@ -670,10 +687,8 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             branch_args = (
                 f"--branch {shlex.quote(repo_branch)} --single-branch " if repo_branch else ""
             )
-            lines.append(
-                f"git clone {branch_args}-- {shlex.quote(repo_url)} {clone_dir_expr}"
-            )
-            lines.append(f'workspace={clone_dir_expr}')
+            lines.append(f"git clone {branch_args}-- {shlex.quote(repo_url)} {clone_dir_expr}")
+            lines.append(f"workspace={clone_dir_expr}")
         if host_config is not None:
             lines.append(render_host_config_write_command(host_config))
         env_prefix = " ".join(
@@ -733,7 +748,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             repo_name=repo_name,
             host_config=host_config,
         )
-        output = self._run_via_job(job_bootstrap, sandbox_id, script)
+        output = self._run_via_job(job_bootstrap, sandbox_id, script, redact=(token,))
         for line in output.splitlines():
             if line.startswith(_WORKSPACE_TAG):
                 return line[len(_WORKSPACE_TAG) :].strip()
@@ -744,7 +759,12 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         )
 
     def _run_via_job(
-        self, job_bootstrap: JobBootstrapConfig, sandbox_id: str, remote_command: str
+        self,
+        job_bootstrap: JobBootstrapConfig,
+        sandbox_id: str,
+        remote_command: str,
+        *,
+        redact: Sequence[str] = (),
     ) -> str:
         """
         Submit and await the one-shot job that SSHes into *sandbox_id* on classic compute.
@@ -769,7 +789,17 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         ``dbutils.secrets.get``, which Databricks redacts from notebook
         output automatically (unlike a job parameter or cluster env var).
 
-        :returns: The job task's captured stdout.
+        The notebook itself is uploaded to a **per-run** path derived from
+        *job_bootstrap.workspace_notebook_path* and removed afterwards. A
+        single fixed path would be a correctness bug, not just untidiness:
+        two concurrent launches would race between upload and run, and the
+        loser would execute the winner's notebook — pointed at the winner's
+        payload secret, and therefore at the wrong sandbox.
+
+        :param redact: Strings (the armed host token) scrubbed from anything
+            the notebook returns, because notebook output is durable job-run
+            JSON readable by anyone with job-read access.
+        :returns: The job task's captured stdout, with *redact* scrubbed.
         :raises click.ClickException: On job failure, timeout, or missing output.
         """
         from databricks.sdk import WorkspaceClient
@@ -777,12 +807,18 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         from databricks.sdk.service.jobs import NotebookTask, RunResultState, SubmitTask
 
         client = WorkspaceClient(profile=self._profile) if self._profile else WorkspaceClient()
-        argv_secret_key = f"job-bootstrap-argv-{uuid.uuid4().hex}"
+        run_key = uuid.uuid4().hex
+        argv_secret_key = f"job-bootstrap-argv-{run_key}"
+        notebook_path = f"{job_bootstrap.workspace_notebook_path}-{run_key}"
         client.secrets.put_secret(
             scope=job_bootstrap.ssh_key_secret_scope,
             key=argv_secret_key,
             string_value=json.dumps(
-                {"sandbox_id": sandbox_id, "remote_command": remote_command}
+                {
+                    "sandbox_id": sandbox_id,
+                    "remote_command": remote_command,
+                    "redact": list(redact),
+                }
             ),
         )
         # The notebook cannot discover these itself: on classic compute
@@ -799,7 +835,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             workspace_id=client.get_workspace_id(),
         )
         client.workspace.upload(
-            job_bootstrap.workspace_notebook_path,
+            notebook_path,
             content=notebook_source.encode("utf-8"),
             overwrite=True,
         )
@@ -810,9 +846,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 tasks=[
                     SubmitTask(
                         task_key="bootstrap",
-                        notebook_task=NotebookTask(
-                            notebook_path=job_bootstrap.workspace_notebook_path
-                        ),
+                        notebook_task=NotebookTask(notebook_path=notebook_path),
                         new_cluster=ClusterSpec(
                             spark_version=job_bootstrap.spark_version,
                             node_type_id=job_bootstrap.node_type_id,
@@ -829,14 +863,25 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             )
             run = waiter.result()
         finally:
-            client.secrets.delete_secret(scope=job_bootstrap.ssh_key_secret_scope, key=argv_secret_key)
+            # Both artifacts are per-run and carry (or point at) the armed
+            # host token, so neither may outlive the run. Cleanup is
+            # best-effort: a failure here must not mask the run's own
+            # outcome, which is the thing the caller needs to see.
+            for cleanup in (
+                lambda: client.secrets.delete_secret(
+                    scope=job_bootstrap.ssh_key_secret_scope, key=argv_secret_key
+                ),
+                lambda: client.workspace.delete(notebook_path),
+            ):
+                try:
+                    cleanup()
+                except Exception as error:  # see comment above
+                    logger.warning("job-bootstrap cleanup failed: %s", error)
         state = run.state
         task_run_id = run.tasks[0].run_id if run.tasks else run.run_id
         run_output = client.jobs.get_run_output(task_run_id)
         notebook_result = (
-            run_output.notebook_output.result
-            if run_output.notebook_output is not None
-            else None
+            run_output.notebook_output.result if run_output.notebook_output is not None else None
         )
         combined_output = "\n".join(
             part for part in (notebook_result, run_output.logs, run_output.error) if part
