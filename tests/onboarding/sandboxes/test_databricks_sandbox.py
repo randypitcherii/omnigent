@@ -847,6 +847,38 @@ class _FakeConfig:
 
 
 @dataclass
+class _FakeApiClient:
+    """
+    Records ``api_client.do`` — the REST control plane's only exit.
+
+    :param responses: Canned reply per ``(method, path)``. A ``list`` value
+        is consumed one entry per call (so a status poll can change), and an
+        ``Exception`` value is raised, standing in for an API error.
+    :param default: Reply for any ``(method, path)`` with no canned entry.
+    """
+
+    responses: dict[tuple[str, str], Any] = field(default_factory=dict)
+    default: Any = field(default_factory=dict)
+    calls: list[tuple[str, str, Any, Any]] = field(default_factory=list)
+
+    def do(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Any = None,
+        query: Any = None,
+    ) -> Any:
+        self.calls.append((method, path, body, query))
+        reply = self.responses.get((method, path), self.default)
+        if isinstance(reply, list):
+            reply = reply.pop(0) if len(reply) > 1 else reply[0]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+@dataclass
 class _FakeWorkspaceClient:
     """Stands in for ``databricks.sdk.WorkspaceClient``."""
 
@@ -854,6 +886,7 @@ class _FakeWorkspaceClient:
     secrets: _FakeSecrets = field(default_factory=_FakeSecrets)
     workspace: _FakeWorkspace = field(default_factory=_FakeWorkspace)
     config: _FakeConfig = field(default_factory=_FakeConfig)
+    api_client: _FakeApiClient = field(default_factory=_FakeApiClient)
 
     def get_workspace_id(self) -> int:
         """The org id the driver notebook needs to route to this workspace."""
@@ -1360,3 +1393,301 @@ def test_compose_bootstrap_script_ends_with_the_workspace_tag() -> None:
         host_config=None,
     )
     assert script.splitlines()[-1] == f'printf "{dbx._WORKSPACE_TAG}%s\\n" "$workspace"'
+
+
+# ── REST control plane ──────────────────────────────────────
+#
+# Configuring `job_bootstrap` also moves create/start/status/config/delete
+# off the `databricks` CLI and onto the workspace REST API, because that
+# mode exists for a Databricks Apps container — which can neither reach
+# the sandbox gateway on 2222 nor run a Go CLI binary it does not have.
+# Every test here proves the CLI is untouched by making both `shutil.which`
+# and `subprocess.run` hostile.
+
+
+def _install_rest(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    responses: dict[tuple[str, str], Any] | None = None,
+    default: Any = None,
+) -> _FakeWorkspaceClient:
+    """
+    Install a fake SDK client and make any CLI use an immediate failure.
+
+    :param responses: Canned `api_client.do` replies keyed by `(method, path)`.
+    :param default: Reply for un-keyed calls; defaults to a Running sandbox.
+    :returns: The fake client backing the launcher.
+    """
+    import databricks.sdk
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _FakeWorkspaceClient(jobs=_FakeJobs(result_state=RunResultState.SUCCESS))
+    fake.api_client = _FakeApiClient(
+        responses=responses or {},
+        default=default if default is not None else _sandbox_record("Running"),
+    )
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_kwargs: fake)
+
+    def _no_cli(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the REST control plane must not shell out to the CLI")
+
+    monkeypatch.setattr(dbx.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(dbx.subprocess, "run", _no_cli)
+
+    # A virtual clock, not a no-op sleep: the wait loops bound themselves on
+    # `monotonic`, so zeroing only `sleep` turns a timeout test into a tight
+    # 600-second spin that polls until the process runs out of memory.
+    clock = {"now": 0.0}
+
+    def _sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr(dbx.time, "sleep", _sleep)
+    monkeypatch.setattr(dbx.time, "monotonic", lambda: clock["now"])
+    return fake
+
+
+def _sandbox_record(status: str, sandbox_id: str = "sb-1") -> dict[str, Any]:
+    """One control-plane sandbox record, in the API's camelCase spelling."""
+    return {
+        "sandboxId": sandbox_id,
+        "name": "managed-a1b2c3d4",
+        "status": status,
+        "gatewayHost": "us-east-1.service-direct.cloud.databricks.com",
+        "idleTimeout": "0s",
+        "noAutostop": True,
+    }
+
+
+def _rest_launcher(**overrides: Any) -> DatabricksSandboxLauncher:
+    """A launcher whose control plane is REST (i.e. `job_bootstrap` set)."""
+    return DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config(), **overrides)
+
+
+@pytest.mark.databricks
+def test_rest_prepare_does_not_require_the_databricks_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Regression guard for the blocker this path exists to fix: `prepare`
+    used to demand the CLI on `PATH`, which no Databricks Apps container
+    has, so every server-initiated launch failed with `INSTALL_HINT`
+    before the job bootstrap could run at all.
+    """
+    fake = _install_rest(monkeypatch, default={"sandboxes": []})
+
+    _rest_launcher().prepare()
+
+    assert fake.api_client.calls == [
+        ("GET", "/api/2.0/lakebox/sandboxes", None, {"page_size": 100})
+    ]
+
+
+@pytest.mark.databricks
+def test_rest_provision_creates_waits_for_running_then_applies_autostop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provision` must return an id that is immediately usable, which the
+    CLI gave for free by blocking — over REST the launcher has to poll.
+    Request bodies are snake_case even though responses are camelCase.
+    """
+    fake = _install_rest(
+        monkeypatch,
+        responses={
+            ("POST", "/api/2.0/lakebox/sandboxes"): {"sandboxId": "sb-1"},
+            ("GET", "/api/2.0/lakebox/sandboxes/sb-1"): [
+                _sandbox_record("Starting"),
+                _sandbox_record("Running"),
+            ],
+        },
+    )
+
+    assert _rest_launcher().provision("managed-a1b2c3d4") == "sb-1"
+
+    methods_and_paths = [(method, path) for method, path, _body, _query in fake.api_client.calls]
+    assert methods_and_paths == [
+        ("POST", "/api/2.0/lakebox/sandboxes"),
+        ("GET", "/api/2.0/lakebox/sandboxes/sb-1"),
+        ("GET", "/api/2.0/lakebox/sandboxes/sb-1"),
+        ("PATCH", "/api/2.0/lakebox/sandboxes/sb-1"),
+    ]
+    assert fake.api_client.calls[0][2] == {"sandbox": {"name": "managed-a1b2c3d4"}}
+    assert fake.api_client.calls[-1][2] == {"sandbox_id": "sb-1", "no_autostop": True}
+
+
+@pytest.mark.databricks
+def test_rest_provision_fails_when_the_sandbox_never_reaches_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_rest(
+        monkeypatch,
+        responses={("POST", "/api/2.0/lakebox/sandboxes"): {"sandboxId": "sb-1"}},
+        default=_sandbox_record("Starting"),
+    )
+
+    with pytest.raises(click.ClickException, match="did not reach running"):
+        _rest_launcher().provision("managed-a1b2c3d4")
+
+
+@pytest.mark.databricks
+def test_rest_resume_starts_the_sandbox_and_waits_for_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `POST .../start` returns as soon as the request is accepted, where the
+    CLI's `start` blocks — so this path owns the wait.
+    """
+    fake = _install_rest(monkeypatch)
+
+    _rest_launcher().resume("sb-1")
+
+    assert [(method, path) for method, path, _body, _query in fake.api_client.calls] == [
+        ("POST", "/api/2.0/lakebox/sandboxes/sb-1/start"),
+        ("GET", "/api/2.0/lakebox/sandboxes/sb-1"),
+    ]
+
+
+@pytest.mark.databricks
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("Running", True), ("Stopped", False), ("Wedged", None)],
+)
+def test_rest_is_running_maps_the_control_plane_status(
+    monkeypatch: pytest.MonkeyPatch, status: str, expected: bool | None
+) -> None:
+    _install_rest(monkeypatch, default=_sandbox_record(status))
+
+    assert _rest_launcher().is_running("sb-1") is expected
+
+
+@pytest.mark.databricks
+def test_rest_attach_starts_a_stopped_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install_rest(
+        monkeypatch,
+        responses={
+            ("GET", "/api/2.0/lakebox/sandboxes/sb-1"): [
+                _sandbox_record("Stopped"),
+                _sandbox_record("Running"),
+            ]
+        },
+    )
+
+    _rest_launcher().attach("sb-1")
+
+    assert ("POST", "/api/2.0/lakebox/sandboxes/sb-1/start", None, None) in fake.api_client.calls
+
+
+@pytest.mark.databricks
+def test_rest_keep_alive_sends_the_idle_timeout_in_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The API takes seconds (`"14400s"`) where config carries the human
+    spelling (`"4h"`) — the CLI did that conversion, so this path must.
+    """
+    fake = _install_rest(monkeypatch)
+
+    _rest_launcher(no_autostop=False, idle_timeout="4h").keep_alive("sb-1")
+
+    assert fake.api_client.calls == [
+        (
+            "PATCH",
+            "/api/2.0/lakebox/sandboxes/sb-1",
+            {"sandbox_id": "sb-1", "idle_timeout": "14400s"},
+            None,
+        )
+    ]
+
+
+@pytest.mark.databricks
+def test_rest_keep_alive_soft_fails_on_a_rejected_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Launcher contract: a rejected auto-stop setting warns, it does not
+    abort the launch — the sandbox is usable, it may just reap on idle.
+    """
+    _install_rest(
+        monkeypatch,
+        responses={("PATCH", "/api/2.0/lakebox/sandboxes/sb-1"): RuntimeError("nope")},
+    )
+
+    _rest_launcher().keep_alive("sb-1")  # must not raise
+
+
+@pytest.mark.databricks
+def test_rest_terminate_deletes_the_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install_rest(monkeypatch)
+
+    _rest_launcher().terminate("sb-1")
+
+    assert fake.api_client.calls == [("DELETE", "/api/2.0/lakebox/sandboxes/sb-1", None, None)]
+
+
+@pytest.mark.databricks
+def test_rest_terminate_is_idempotent_for_a_missing_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-gone sandbox is the desired end state. The API says so with
+    `{"error_code":"NOT_FOUND","message":"sandbox … not found"}`.
+    """
+    _install_rest(
+        monkeypatch,
+        responses={
+            ("DELETE", "/api/2.0/lakebox/sandboxes/sb-1"): RuntimeError("sandbox sb-1 not found")
+        },
+    )
+
+    _rest_launcher().terminate("sb-1")  # must not raise
+
+
+@pytest.mark.databricks
+def test_rest_terminate_still_raises_on_a_real_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_rest(
+        monkeypatch,
+        responses={
+            ("DELETE", "/api/2.0/lakebox/sandboxes/sb-1"): RuntimeError("permission denied")
+        },
+    )
+
+    with pytest.raises(click.ClickException, match="delete Databricks Sandbox"):
+        _rest_launcher().terminate("sb-1")
+
+
+@pytest.mark.databricks
+def test_the_control_plane_stays_on_the_cli_without_job_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The laptop path is unchanged: no `job_bootstrap` means no SDK import
+    and no REST call, so this launcher keeps working from a machine that
+    CAN reach the sandbox gateway.
+    """
+    cli = _install(monkeypatch)
+    cli.reply_with("create", _Reply(stdout=json.dumps({"sandboxId": "sb-1"})))
+
+    launcher = DatabricksSandboxLauncher()
+    assert launcher.provision("managed-a1b2c3d4") == "sb-1"
+    assert launcher._client is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("4h", "14400s"), ("90m", "5400s"), ("30s", "30s"), ("1h30m", "5400s")],
+)
+def test_as_api_duration_normalizes_go_durations(value: str, expected: str) -> None:
+    assert dbx._as_api_duration(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "4 hours", "forever", "4d"])
+def test_as_api_duration_rejects_what_it_cannot_read(value: str) -> None:
+    """
+    Fail loudly rather than send an unreadable spelling through: silently
+    defaulting would set an idle timeout the operator did not ask for.
+    """
+    with pytest.raises(click.ClickException, match="idle timeout"):
+        dbx._as_api_duration(value)

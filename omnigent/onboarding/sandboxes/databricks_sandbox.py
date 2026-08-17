@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -199,6 +200,10 @@ _LAKEBOX_API_ROOT: str = "/api/2.0/lakebox"
 
 # Port the sandbox SSH gateway listens on (CLI: `defaultGatewayPort`).
 _SANDBOX_GATEWAY_PORT: str = "2222"
+
+# Gap between control-plane status polls while waiting for a sandbox to
+# reach Running. Matches the interval the bootstrap notebook uses.
+_REST_POLL_INTERVAL_S: float = 5.0
 
 # Driver notebook staged (and overwritten on every submission) at
 # `JobBootstrapConfig.workspace_notebook_path`. Runs on the classic-compute
@@ -470,6 +475,31 @@ def _forward_failure_detail(transcript: list[str]) -> str:
     return " / ".join(lines) or "<no output>"
 
 
+def _as_api_duration(value: str) -> str:
+    """
+    Normalize an idle-timeout string into the seconds form the API takes.
+
+    The CLI accepts Go durations (``"4h"``, ``"90m"``, ``"30s"``) and puts
+    seconds on the wire — ``--idle-timeout 4h`` sends ``"14400s"``. Config
+    files carry the human spelling, so convert here rather than making
+    operators do arithmetic.
+
+    :param value: A Go-style duration, or already-normalized seconds.
+    :returns: The duration as ``"<seconds>s"``.
+    :raises click.ClickException: If the spelling is not understood, since
+        silently sending it through would set an unintended timeout.
+    """
+    text = value.strip().lower()
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text)
+    if not text or match is None or not any(match.groups()):
+        raise click.ClickException(
+            f"Could not read idle timeout {value!r}: expected a duration like "
+            "'4h', '90m', or '30s'."
+        )
+    hours, minutes, seconds = (int(group or 0) for group in match.groups())
+    return f"{hours * 3600 + minutes * 60 + seconds}s"
+
+
 def _looks_missing(output: str) -> bool:
     """
     Return whether CLI output reports the sandbox as nonexistent.
@@ -614,6 +644,13 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             :class:`JobBootstrapConfig`. ``None`` (the default) preserves
             direct SSH exactly, so this launcher keeps working unmodified
             from a laptop that CAN reach the sandbox gateway.
+
+            Setting it ALSO moves the whole control plane (create, start,
+            status, config, delete) off the ``databricks`` CLI and onto the
+            workspace REST API — see the "REST control plane" section. Both
+            follow from the same fact: this mode exists for a Databricks
+            Apps container, which can neither reach port 2222 nor run a Go
+            CLI binary that is not installed in it.
         """
         self._cli_path = cli_path or DEFAULT_CLI_BINARY
         self._profile = profile
@@ -621,6 +658,9 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         self._no_autostop = no_autostop
         self._bootstrap_command = bootstrap_command
         self._job_bootstrap = job_bootstrap
+        # Memoized lazily by `_sdk()`; the SDK is an optional extra, so it is
+        # never imported on the direct-SSH path.
+        self._client: object | None = None
 
     def start_host(self, sandbox_id: str, **kwargs):  # type: ignore[override]
         """Run the configured bootstrap, then start the host as usual.
@@ -801,11 +841,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         :returns: The job task's captured stdout, with *redact* scrubbed.
         :raises click.ClickException: On job failure, timeout, or missing output.
         """
-        from databricks.sdk import WorkspaceClient
         from databricks.sdk.service.compute import ClusterSpec
         from databricks.sdk.service.jobs import NotebookTask, RunResultState, SubmitTask
 
-        client = WorkspaceClient(profile=self._profile) if self._profile else WorkspaceClient()
+        client = self._sdk()
         run_key = uuid.uuid4().hex
         argv_secret_key = f"job-bootstrap-argv-{run_key}"
         notebook_path = f"{job_bootstrap.workspace_notebook_path}-{run_key}"
@@ -991,6 +1030,98 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             )
         return payload
 
+    # ── REST control plane ──────────────────────────────
+    #
+    # Everything below reaches the sandbox control plane over the workspace
+    # REST API through the Databricks SDK, with NO `databricks` CLI. That is
+    # not a nicety: the CLI is a Go binary that does not exist inside a
+    # Databricks Apps python container, so on the server-side path every
+    # lifecycle call in this class would die with `INSTALL_HINT` long before
+    # the job-delegated bootstrap ever ran.
+    #
+    # The switch is `job_bootstrap`: it is configured exactly when this
+    # process cannot reach the sandbox gateway itself (an Apps container),
+    # which is also exactly when the CLI is unavailable. One config key,
+    # both consequences — see :meth:`_use_rest`.
+    #
+    # Request/response shapes were read off the CLI's own traffic
+    # (`databricks sandbox … --debug`) rather than guessed. Note the
+    # asymmetry: request bodies are snake_case, responses camelCase.
+
+    def _use_rest(self) -> bool:
+        """Whether the control plane goes over REST instead of the CLI."""
+        return self._job_bootstrap is not None
+
+    def _sdk(self):
+        """
+        Return a memoized ``WorkspaceClient``.
+
+        Inside an App the environment supplies the credentials; locally the
+        configured *profile* selects them. Memoized because a managed host's
+        liveness polling calls the control plane repeatedly and each
+        construction re-runs credential resolution.
+        """
+        if self._client is None:
+            from databricks.sdk import WorkspaceClient
+
+            self._client = (
+                WorkspaceClient(profile=self._profile) if self._profile else WorkspaceClient()
+            )
+        return self._client
+
+    def _api(
+        self,
+        method: str,
+        path: str,
+        *,
+        action: str,
+        body: dict[str, object] | None = None,
+        query: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """
+        Make one sandbox control-plane REST call.
+
+        :param method: HTTP verb, e.g. ``"GET"``.
+        :param path: Path under the workspace host, e.g.
+            ``"/api/2.0/lakebox/sandboxes/sb-1"``.
+        :param action: Human phrase for error messages.
+        :param body: JSON request body (snake_case keys).
+        :param query: Query-string parameters.
+        :returns: The decoded response object, ``{}`` for an empty body.
+        :raises click.ClickException: On any API failure.
+        """
+        try:
+            payload = self._sdk().api_client.do(method, path, body=body, query=query)
+        except Exception as error:  # SDK raises a wide family of DatabricksErrors
+            raise click.ClickException(f"Could not {action}: {error}") from error
+        return payload if isinstance(payload, dict) else {}
+
+    def _rest_sandbox(self, sandbox_id: str) -> dict[str, object]:
+        """Return one sandbox's control-plane record (camelCase keys)."""
+        return self._api(
+            "GET",
+            f"{_LAKEBOX_API_ROOT}/sandboxes/{sandbox_id}",
+            action=f"read Databricks Sandbox '{sandbox_id}'",
+        )
+
+    def _rest_wait_running(self, sandbox_id: str, *, timeout: float) -> None:
+        """
+        Poll until the sandbox reports Running.
+
+        :raises click.ClickException: If it never does within *timeout*.
+        """
+        deadline = time.monotonic() + timeout
+        status = ""
+        while time.monotonic() < deadline:
+            status = str(self._rest_sandbox(sandbox_id).get("status", "")).lower()
+            if status == _RUNNING_STATUS:
+                return
+            time.sleep(_REST_POLL_INTERVAL_S)
+        raise click.ClickException(
+            f"Databricks Sandbox '{sandbox_id}' did not reach running within "
+            f"{timeout:.0f}s (last status {status or 'unknown'!r})."
+        )
+
     # ── Lifecycle ───────────────────────────────────────
 
     def prepare(self) -> None:
@@ -1005,6 +1136,18 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: When the CLI is missing (with the
             install hint) or unauthenticated (with the login hint).
         """
+        if self._use_rest():
+            # No CLI to check: on this path there is none, and requiring one
+            # would fail every launch from inside an App. Listing sandboxes
+            # is the REST equivalent — read-only, and it fails when the
+            # workspace credentials do not resolve.
+            self._api(
+                "GET",
+                f"{_LAKEBOX_API_ROOT}/sandboxes",
+                action="list Databricks Sandboxes",
+                query={"page_size": 100},
+            )
+            return
         if shutil.which(self._cli_path) is None:
             raise click.ClickException(INSTALL_HINT)
         completed = self._cli(
@@ -1034,17 +1177,30 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             returns no id.
         """
         click.echo(f"▸ Creating Databricks Sandbox '{name}'")
-        payload = self._cli_json(
-            self._argv("create", "--name", name, "--json"),
-            timeout=_CREATE_TIMEOUT_S,
-            action="create a Databricks Sandbox",
-        )
+        if self._use_rest():
+            payload = self._api(
+                "POST",
+                f"{_LAKEBOX_API_ROOT}/sandboxes",
+                action="create a Databricks Sandbox",
+                body={"sandbox": {"name": name}},
+            )
+        else:
+            payload = self._cli_json(
+                self._argv("create", "--name", name, "--json"),
+                timeout=_CREATE_TIMEOUT_S,
+                action="create a Databricks Sandbox",
+            )
         sandbox_id = payload.get("sandboxId")
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise click.ClickException(
                 f"Databricks Sandbox creation returned no 'sandboxId' — got {payload!r}."
             )
         click.echo(f"  → created {sandbox_id}")
+        if self._use_rest():
+            # The CLI's `create` blocks until the microVM reports Running and
+            # callers rely on the returned id being immediately usable, so the
+            # REST path has to wait for the same condition itself.
+            self._rest_wait_running(sandbox_id, timeout=_CREATE_TIMEOUT_S)
         self.keep_alive(sandbox_id)
         return sandbox_id
 
@@ -1075,11 +1231,21 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: If the start fails or times out.
         """
         click.echo(f"▸ Starting Databricks Sandbox '{sandbox_id}'")
-        self._cli(
-            self._argv("start", sandbox_id),
-            timeout=_START_TIMEOUT_S,
-            action=f"start Databricks Sandbox '{sandbox_id}'",
-        )
+        if self._use_rest():
+            self._api(
+                "POST",
+                f"{_LAKEBOX_API_ROOT}/sandboxes/{sandbox_id}/start",
+                action=f"start Databricks Sandbox '{sandbox_id}'",
+            )
+            # `start` returns as soon as the request is accepted, so unlike the
+            # CLI (which blocks) this path must poll for Running itself.
+            self._rest_wait_running(sandbox_id, timeout=_START_TIMEOUT_S)
+        else:
+            self._cli(
+                self._argv("start", sandbox_id),
+                timeout=_START_TIMEOUT_S,
+                action=f"start Databricks Sandbox '{sandbox_id}'",
+            )
         click.echo(f"  → running {sandbox_id}")
 
     def is_running(self, sandbox_id: str) -> bool | None:
@@ -1107,11 +1273,14 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             control plane reported no status field.
         :raises click.ClickException: If the status call fails.
         """
-        payload = self._cli_json(
-            self._argv("status", sandbox_id, "-o", "json"),
-            timeout=_CONTROL_TIMEOUT_S,
-            action=f"read the status of Databricks Sandbox '{sandbox_id}'",
-        )
+        if self._use_rest():
+            payload = self._rest_sandbox(sandbox_id)
+        else:
+            payload = self._cli_json(
+                self._argv("status", sandbox_id, "-o", "json"),
+                timeout=_CONTROL_TIMEOUT_S,
+                action=f"read the status of Databricks Sandbox '{sandbox_id}'",
+            )
         status = payload.get("status")
         return status.lower() if isinstance(status, str) else ""
 
@@ -1134,20 +1303,43 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             description = f"idle timeout set to {self._idle_timeout}"
         else:
             return
-        completed = self._cli(
-            self._argv("config", sandbox_id, *flags),
-            action=f"configure Databricks Sandbox '{sandbox_id}'",
-            check=False,
-        )
-        if completed.returncode != 0:
-            click.echo(
-                f"  → warning: could not configure auto-stop on '{sandbox_id}' "
-                f"({_combined(completed).strip() or 'no output'}); the sandbox "
-                "may stop after its idle timeout.",
-                err=True,
+        if self._use_rest():
+            # `sandbox_id` is repeated in the body, not just the path — the
+            # CLI sends it that way and the API expects it.
+            body: dict[str, object] = {"sandbox_id": sandbox_id}
+            if self._no_autostop:
+                body["no_autostop"] = True
+            else:
+                body["idle_timeout"] = _as_api_duration(self._idle_timeout or "")
+            try:
+                self._api(
+                    "PATCH",
+                    f"{_LAKEBOX_API_ROOT}/sandboxes/{sandbox_id}",
+                    action=f"configure Databricks Sandbox '{sandbox_id}'",
+                    body=body,
+                )
+            except click.ClickException as error:
+                self._warn_autostop(sandbox_id, error.format_message())
+                return
+        else:
+            completed = self._cli(
+                self._argv("config", sandbox_id, *flags),
+                action=f"configure Databricks Sandbox '{sandbox_id}'",
+                check=False,
             )
-            return
+            if completed.returncode != 0:
+                self._warn_autostop(sandbox_id, _combined(completed).strip() or "no output")
+                return
         click.echo(f"  → {description}")
+
+    @staticmethod
+    def _warn_autostop(sandbox_id: str, detail: str) -> None:
+        """Report a soft-failed auto-stop change without aborting the launch."""
+        click.echo(
+            f"  → warning: could not configure auto-stop on '{sandbox_id}' "
+            f"({detail}); the sandbox may stop after its idle timeout.",
+            err=True,
+        )
 
     def terminate(self, sandbox_id: str) -> None:
         """
@@ -1162,6 +1354,20 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: When the delete fails for any
             reason other than the sandbox not existing.
         """
+        if self._use_rest():
+            try:
+                self._api(
+                    "DELETE",
+                    f"{_LAKEBOX_API_ROOT}/sandboxes/{sandbox_id}",
+                    action=f"delete Databricks Sandbox '{sandbox_id}'",
+                )
+            except click.ClickException as error:
+                # Same idempotence as the CLI path: an already-gone sandbox
+                # is the desired end state. The API says so with
+                # `{"error_code":"NOT_FOUND","message":"sandbox … not found"}`.
+                if not _looks_missing(error.format_message()):
+                    raise
+            return
         completed = self._cli(
             self._argv("delete", sandbox_id, "--auto-approve"),
             action=f"delete Databricks Sandbox '{sandbox_id}'",
