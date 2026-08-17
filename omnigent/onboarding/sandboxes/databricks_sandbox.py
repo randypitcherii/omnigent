@@ -388,11 +388,10 @@ class JobBootstrapConfig:
     (OpenSSH format, as written by ``databricks sandbox register``)."""
 
     workspace_notebook_path: str
-    """Workspace path the launcher (over)writes with the one-shot bootstrap
-    notebook before every job submission, e.g.
-    ``"/Shared/omnigent/sandbox-job-bootstrap"``. Reused across runs — the
-    notebook is a fixed driver script; only the connect payload it reads
-    from a transient secret varies."""
+    """Base workspace path for the one-shot bootstrap notebook, e.g.
+    ``"/Shared/omnigent/sandbox-job-bootstrap"``. Each run uploads to a
+    per-run path derived from this and deletes it afterwards, so two
+    concurrent launches can never race over one artifact."""
 
     node_type_id: str = "m5d.large"
     """Classic-compute node type for the throwaway single-node cluster.
