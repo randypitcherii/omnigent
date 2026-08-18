@@ -888,34 +888,39 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 }
             ),
         )
-        # The notebook cannot discover these itself: on classic compute
-        # `apiUrl()` yields the regional control-plane host, which needs the
-        # workspace's org id alongside it to route. Both are known here.
-        notebook_source = _JOB_BOOTSTRAP_NOTEBOOK_TEMPLATE.format(
-            ssh_key_scope=job_bootstrap.ssh_key_secret_scope,
-            ssh_key_key=job_bootstrap.ssh_key_secret_key,
-            argv_scope=job_bootstrap.payload_scope,
-            argv_key=argv_secret_key,
-            api_root=_LAKEBOX_API_ROOT,
-            gateway_port=_SANDBOX_GATEWAY_PORT,
-            workspace_host=client.config.host,
-            workspace_id=client.get_workspace_id(),
-        )
-        # `format` and `language` are both load-bearing, despite the SDK
-        # docstring implying SOURCE is the default: omit `format` and the
-        # workspace import API treats the body as a DBC archive and rejects
-        # it with "The zip archive contains no items", and the SDK only
-        # infers `language` from a path suffix — the per-run notebook path
-        # deliberately has none.
-        client.workspace.upload(
-            notebook_path,
-            content=notebook_source.encode("utf-8"),
-            format=ImportFormat.SOURCE,
-            language=Language.PYTHON,
-            overwrite=True,
-        )
         run = None
         try:
+            # The notebook cannot discover these itself: on classic compute
+            # `apiUrl()` yields the regional control-plane host, which needs
+            # the workspace's org id alongside it to route. Both are known
+            # here. Everything from the payload write onwards lives inside
+            # this `try` so that a failure between the write and the run --
+            # an upload rejection, a submit error -- still reaches the
+            # cleanup below; leaving the payload behind would leave the armed
+            # host token readable in the workspace.
+            notebook_source = _JOB_BOOTSTRAP_NOTEBOOK_TEMPLATE.format(
+                ssh_key_scope=job_bootstrap.ssh_key_secret_scope,
+                ssh_key_key=job_bootstrap.ssh_key_secret_key,
+                argv_scope=job_bootstrap.payload_scope,
+                argv_key=argv_secret_key,
+                api_root=_LAKEBOX_API_ROOT,
+                gateway_port=_SANDBOX_GATEWAY_PORT,
+                workspace_host=client.config.host,
+                workspace_id=client.get_workspace_id(),
+            )
+            # `format` and `language` are both load-bearing, despite the SDK
+            # docstring implying SOURCE is the default: omit `format` and the
+            # workspace import API treats the body as a DBC archive and rejects
+            # it with "The zip archive contains no items", and the SDK only
+            # infers `language` from a path suffix — the per-run notebook path
+            # deliberately has none.
+            client.workspace.upload(
+                notebook_path,
+                content=notebook_source.encode("utf-8"),
+                format=ImportFormat.SOURCE,
+                language=Language.PYTHON,
+                overwrite=True,
+            )
             waiter = client.jobs.submit(
                 run_name="omnigent-sandbox-job-bootstrap",
                 tasks=[

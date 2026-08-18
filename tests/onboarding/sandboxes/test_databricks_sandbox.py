@@ -1116,6 +1116,43 @@ def test_start_host_via_job_stages_the_sandbox_id_with_the_script(
 
 
 @pytest.mark.databricks
+def test_job_bootstrap_deletes_the_payload_when_the_notebook_upload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed upload must still take the payload secret with it.
+
+    The payload carries the armed host token, so anything that aborts the
+    launch between the secret write and the job run has to clean it up or
+    the token stays readable in the workspace. Observed for real: an upload
+    rejection left a `job-bootstrap-argv-*` secret behind.
+    """
+    fake = _install_job_bootstrap(monkeypatch)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("The zip archive contains no items.")
+
+    monkeypatch.setattr(fake.workspace, "upload", _boom)
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(payload_secret_scope="omnigent-sandbox-payload")
+    )
+
+    with pytest.raises(RuntimeError, match="zip archive"):
+        launcher.start_host(
+            "sb-1",
+            token="armed-token",
+            host_id="host-1",
+            host_name="host-name",
+            server_url="https://omnigent.example.com",
+        )
+
+    assert [scope for scope, _key in fake.secrets.delete_calls] == ["omnigent-sandbox-payload"]
+    assert [key for _scope, key in fake.secrets.delete_calls] == [
+        key for _scope, key, _value in fake.secrets.put_calls
+    ]
+
+
+@pytest.mark.databricks
 def test_job_bootstrap_notebook_uploads_as_python_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
