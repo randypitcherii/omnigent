@@ -209,14 +209,9 @@ _WARM_CLUSTER_TAG_VALUE: str = "warm-compute"
 
 # Databricks Apps hostname suffix. A server URL on this host is fronted by the
 # Apps OAuth edge, which answers HTTP 302 to anything but a workspace OAuth
-# token -- and a sandbox holds a workspace PAT, not an OAuth token. See
-# `_dial_back_url`.
+# token -- and a sandbox holds a workspace PAT, not an OAuth token, and cannot
+# obtain one. See `_resolve_dial_back_url`.
 _APPS_HOST_SUFFIX: str = ".databricksapps.com"
-
-# The same server, reachable as a workspace API mount. Accepts a workspace PAT
-# normally, and `_resolve_server_url` in the CLI already treats it as the
-# canonical form of a Databricks-hosted Omnigent server.
-_WORKSPACE_API_PATH: str = "/api/2.0/omnigent"
 
 # Sandbox control-plane REST surface, as used by the bootstrap notebook.
 # Mirrors `cmd/sandbox/api.go` in the Databricks CLI, whose `sandboxAPIRoot`
@@ -775,6 +770,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         no_autostop: bool = True,
         bootstrap_command: str | None = None,
         job_bootstrap: JobBootstrapConfig | None = None,
+        dial_back_url: str | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -807,6 +803,13 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             follow from the same fact: this mode exists for a Databricks
             Apps container, which can neither reach port 2222 nor run a Go
             CLI binary that is not installed in it.
+        :param dial_back_url: Overrides the server URL the in-sandbox host
+            dials, e.g. ``"https://omnigent.example.com"`` for a reverse proxy
+            that fronts the same server on an address a sandbox can
+            authenticate to. ``None`` (the default) means the host dials
+            ``sandbox.server_url`` as configured -- which a Databricks Apps
+            URL cannot be, so that combination is rejected up front rather
+            than left to time out. See :meth:`_resolve_dial_back_url`.
         """
         self._cli_path = cli_path or DEFAULT_CLI_BINARY
         self._profile = profile
@@ -814,6 +817,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         self._no_autostop = no_autostop
         self._bootstrap_command = bootstrap_command
         self._job_bootstrap = job_bootstrap
+        self._dial_back_url = (dial_back_url or "").strip().rstrip("/") or None
         # Memoized lazily by `_sdk()`; the SDK is an optional extra, so it is
         # never imported on the direct-SSH path.
         self._client: object | None = None
@@ -838,89 +842,70 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         because THIS process (typically inside a Databricks App) cannot
         reach the sandbox gateway on port 2222.
 
-        ``server_url`` is rewritten first when it names a Databricks Apps
-        host, on both paths -- see :meth:`_dial_back_url`.
+        ``server_url`` is resolved first, on both paths -- see
+        :meth:`_resolve_dial_back_url`.
         """
         server_url = kwargs.get("server_url")
         if isinstance(server_url, str):
-            kwargs["server_url"] = self._dial_back_url(server_url)
+            kwargs["server_url"] = self._resolve_dial_back_url(server_url)
         if self._job_bootstrap is not None:
             return self._start_host_via_job(sandbox_id, self._job_bootstrap, **kwargs)
         if self._bootstrap_command:
             self.run(sandbox_id, self._bootstrap_command)
         return super().start_host(sandbox_id, **kwargs)
 
-    def _dial_back_url(self, server_url: str) -> str:
+    def _resolve_dial_back_url(self, server_url: str) -> str:
         """
-        Translate a Databricks Apps server URL to its workspace API mount.
+        Resolve the URL the in-sandbox host should dial back to.
 
         A sandbox authenticates as its owner with the ambient workspace PAT
-        the platform mounts at ``/run/lakebox/databrickscfg`` -- it holds no
-        workspace OAuth token and cannot mint one (the in-sandbox
-        ``databricks auth login`` flow needs a browser). The Apps OAuth edge
-        answers HTTP 302 to a PAT, so an ``omnigent host`` pointed at the
-        ``*.databricksapps.com`` hostname dies on its ``/v1/me`` pre-flight
-        before it can ever register, and the managed launch fails with a
-        registration timeout. The SAME server answered through the workspace
-        API mount accepts that PAT and carries the full host tunnel.
+        the platform mounts at ``/run/lakebox/databrickscfg``. That is the
+        only credential it has: it holds no workspace OAuth token, cannot
+        mint one (the in-sandbox ``databricks auth login`` flow needs a
+        browser), and cannot exchange the PAT for one (workspace token
+        exchange requires a federation policy the sandbox identity has none
+        of). The Databricks Apps edge answers HTTP 302 to that PAT under
+        every header spelling, so an ``omnigent host`` pointed at a
+        ``*.databricksapps.com`` URL dies on its ``/v1/me`` pre-flight and
+        the launch fails as an opaque registration timeout two minutes
+        later.
 
-        So the operator still configures ``sandbox.server_url`` as the app's
-        public URL -- the honest answer to "where is this server?" -- and this
-        provider rewrites it to the one form its sandboxes can authenticate
-        against. Any other URL (a workspace mount already, a non-Databricks
-        host, a local server) is returned untouched.
+        So an Apps ``server_url`` is rejected HERE, before a sandbox is
+        provisioned and a bootstrap job submitted, naming the reason. An
+        operator who has arranged a reachable address for the same server --
+        a reverse proxy, a tunnel, or an in-sandbox credential this launcher
+        cannot see -- points ``sandbox.databricks.dial_back_url`` at it and
+        that URL is used verbatim.
+
+        Note this deliberately does NOT rewrite an Apps URL to the
+        ``/api/2.0/omnigent`` workspace mount: that path is Databricks'
+        own first-party host-sharded Omnigent deployment (see
+        ``omnigent.cli_auth.WORKSPACE_API_PATH``), a DIFFERENT server from
+        a self-deployed App. Sending a host there registers it with someone
+        else's coordinator, which looks exactly like success from the
+        outside and is not.
 
         :param server_url: The configured dial-back URL, e.g.
             ``"https://omnigent-dev-123.aws.databricksapps.com"``.
-        :returns: The URL the in-sandbox host should dial, e.g.
-            ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
-        :raises click.ClickException: If the URL is an Apps URL but no
-            workspace host can be resolved to rewrite it to -- failing here
-            beats failing later inside the sandbox, where the only symptom is
-            an opaque registration timeout.
+        :returns: The URL the in-sandbox host should dial.
+        :raises click.ClickException: When *server_url* is a Databricks Apps
+            URL and no ``dial_back_url`` override is configured.
         """
         from urllib.parse import urlsplit
 
+        if self._dial_back_url is not None:
+            logger.info("dialing back through the configured URL %s", self._dial_back_url)
+            return self._dial_back_url
         hostname = urlsplit(server_url).hostname or ""
         if not hostname.endswith(_APPS_HOST_SUFFIX):
             return server_url
-        workspace_host = self._workspace_host()
-        if not workspace_host:
-            raise click.ClickException(
-                f"Databricks Sandbox hosts cannot authenticate to the Databricks Apps "
-                f"URL {server_url!r} (its OAuth edge rejects the workspace PAT a sandbox "
-                f"holds), and no workspace host could be resolved to rewrite it to the "
-                f"{_WORKSPACE_API_PATH} mount. Set DATABRICKS_HOST, or configure "
-                f"'sandbox.server_url' as the workspace mount URL directly."
-            )
-        rewritten = f"{workspace_host}{_WORKSPACE_API_PATH}"
-        logger.info("dialing back through the workspace API mount %s", rewritten)
-        return rewritten
-
-    def _workspace_host(self) -> str | None:
-        """
-        Resolve this workspace's base URL, e.g.
-        ``"https://example.cloud.databricks.com"``.
-
-        Prefers the ambient ``DATABRICKS_HOST`` (always set inside a
-        Databricks App, and cheap) so the direct-SSH path never pulls in the
-        optional SDK extra; falls back to the SDK's own resolution, which the
-        job-delegated path has already loaded anyway.
-
-        :returns: The workspace base URL without a trailing slash, or ``None``
-            when neither source resolves one.
-        """
-        import os
-
-        host = (os.environ.get("DATABRICKS_HOST") or "").strip().rstrip("/")
-        if not host:
-            try:
-                host = str(getattr(self._sdk().config, "host", "") or "").strip().rstrip("/")
-            except Exception:  # pragma: no cover - optional SDK, best effort
-                return None
-        if not host:
-            return None
-        return host if "://" in host else f"https://{host}"
+        raise click.ClickException(
+            f"A Databricks Sandbox host cannot authenticate to the Databricks Apps URL "
+            f"{server_url!r}: the Apps OAuth edge rejects the workspace PAT a sandbox "
+            f"holds, and a sandbox can neither mint nor exchange for an OAuth token. "
+            f"Front this server on an address the sandbox can reach and set "
+            f"'sandbox.databricks.dial_back_url' to it."
+        )
 
     # ── Job-delegated bootstrap ─────────────────────────
 
@@ -1101,9 +1086,21 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         long-lived cluster nobody recognizes is a long-lived cluster somebody
         deletes.
 
+        One thing DOES differ from the submitted job cluster: the access mode
+        must be stated. An all-purpose cluster created with no
+        ``data_security_mode`` lands on the legacy no-isolation mode, which
+        many workspaces forbid outright ("NO_ISOLATION or custom access modes
+        are not allowed in this workspace"), so creation fails and the whole
+        managed launch fails with it. ``SINGLE_USER`` is the mode that matches
+        what this cluster does — run one principal's bootstrap notebook — and
+        the single user is the identity creating it (inside a Databricks App,
+        the app's service principal).
+
         :returns: The new cluster id.
         :raises click.ClickException: When creation fails or times out.
         """
+        from databricks.sdk.service.compute import DataSecurityMode
+
         client = self._sdk()
         logger.info("creating warm bootstrap cluster %s", name)
         try:
@@ -1113,6 +1110,8 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 node_type_id=job_bootstrap.node_type_id,
                 num_workers=0,
                 autotermination_minutes=job_bootstrap.autotermination_minutes,
+                data_security_mode=DataSecurityMode.SINGLE_USER,
+                single_user_name=self._current_principal(),
                 spark_conf={
                     "spark.master": "local[*]",
                     "spark.databricks.cluster.profile": "singleNode",
@@ -1132,6 +1131,23 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 f"Databricks reported no cluster id for created warm bootstrap cluster {name!r}."
             )
         return cluster_id
+
+    def _current_principal(self) -> str | None:
+        """
+        Resolve the identity this launcher authenticates as, for
+        ``single_user_name`` on the warm cluster.
+
+        Inside a Databricks App this is the app's service principal (its
+        application id); locally it is the operator's username. Returns
+        ``None`` when the lookup fails, which lets the create fall back to
+        whatever the API defaults the single user to rather than turning a
+        best-effort identity lookup into a failed launch.
+        """
+        try:
+            return self._sdk().current_user.me().user_name
+        except Exception:  # pragma: no cover - best effort identity lookup
+            logger.warning("could not resolve the current principal for the warm cluster")
+            return None
 
     def _await_cluster_running(self, cluster_id: str) -> None:
         """

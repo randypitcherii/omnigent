@@ -1151,6 +1151,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "no_autostop",
                     "bootstrap_command",
                     "job_bootstrap",
+                    "dial_back_url",
                 },
                 "sandbox.databricks",
             )
@@ -1162,6 +1163,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             no_autostop=True if no_autostop is None else no_autostop,
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
             job_bootstrap=_parse_databricks_job_bootstrap(databricks_section),
+            dial_back_url=_parse_provider_string(raw, "databricks", "dial_back_url"),
         )
         token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
@@ -2037,6 +2039,7 @@ def _databricks_launcher_factory(
     no_autostop: bool,
     bootstrap_command: str | None = None,
     job_bootstrap: JobBootstrapConfig | None = None,
+    dial_back_url: str | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: databricks`` path.
@@ -2057,6 +2060,12 @@ def _databricks_launcher_factory(
         a classic-compute Databricks Job, or ``None`` to SSH directly.
         Required when the server runs as a Databricks App, whose container
         cannot reach the sandbox gateway on 2222.
+    :param dial_back_url: Address the in-sandbox host dials instead of
+        ``sandbox.server_url``, e.g. ``"https://omnigent.example.com"`` for a
+        reverse proxy fronting this server where a sandbox can authenticate to
+        it. ``None`` dials ``sandbox.server_url`` unchanged -- which the
+        launcher rejects for a Databricks Apps URL, since a sandbox holds only
+        a workspace PAT and the Apps OAuth edge refuses it.
     :returns: A factory producing parameterized Databricks launchers.
     """
 
@@ -2071,6 +2080,7 @@ def _databricks_launcher_factory(
             no_autostop=no_autostop,
             bootstrap_command=bootstrap_command,
             job_bootstrap=job_bootstrap,
+            dial_back_url=dial_back_url,
         )
 
     return _build
