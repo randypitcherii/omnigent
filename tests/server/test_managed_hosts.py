@@ -1570,6 +1570,7 @@ def test_parse_databricks_job_bootstrap_reaches_the_launcher() -> None:
                 "job_bootstrap": {
                     "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
                     "ssh_key_secret_key": "sandbox-ssh-private-key",
+                    "payload_secret_scope": "omnigent-sandbox-payload",
                     "workspace_notebook_path": "/Users/me/omnigent/bootstrap",
                     "node_type_id": "m5d.xlarge",
                     "timeout_s": 900,
@@ -1579,15 +1580,43 @@ def test_parse_databricks_job_bootstrap_reaches_the_launcher() -> None:
     )
 
     assert cfg is not None
-    launcher = cfg.launcher_factory()
+    launcher = cfg.default.launcher_factory()
     assert isinstance(launcher, DatabricksSandboxLauncher)
     bootstrap = launcher._job_bootstrap
     assert bootstrap is not None
     assert bootstrap.ssh_key_secret_scope == "omnigent-sandbox-bootstrap"
     assert bootstrap.ssh_key_secret_key == "sandbox-ssh-private-key"
+    assert bootstrap.payload_scope == "omnigent-sandbox-payload"
     assert bootstrap.workspace_notebook_path == "/Users/me/omnigent/bootstrap"
     assert bootstrap.node_type_id == "m5d.xlarge"
     assert bootstrap.timeout_s == 900.0
+
+
+def test_parse_databricks_job_bootstrap_payload_scope_defaults_to_the_key_scope() -> None:
+    """
+    Omitting ``payload_secret_scope`` must keep the pre-split behavior —
+    payload and key share one scope — rather than leaving the payload scope
+    unset and failing the first launch with an empty scope name.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://s.example.com",
+            "databricks": {
+                "job_bootstrap": {
+                    "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
+                    "ssh_key_secret_key": "sandbox-ssh-private-key",
+                    "workspace_notebook_path": "/Users/me/omnigent/bootstrap",
+                },
+            },
+        }
+    )
+
+    assert cfg is not None
+    bootstrap = cfg.default.launcher_factory()._job_bootstrap  # type: ignore[attr-defined]
+    assert bootstrap is not None
+    assert bootstrap.payload_secret_scope is None
+    assert bootstrap.payload_scope == "omnigent-sandbox-bootstrap"
 
 
 def test_parse_databricks_without_job_bootstrap_leaves_direct_ssh() -> None:
@@ -1598,7 +1627,7 @@ def test_parse_databricks_without_job_bootstrap_leaves_direct_ssh() -> None:
     cfg = parse_sandbox_config({"provider": "databricks", "server_url": "https://s.example.com"})
 
     assert cfg is not None
-    launcher = cfg.launcher_factory()
+    launcher = cfg.default.launcher_factory()
     assert isinstance(launcher, DatabricksSandboxLauncher)
     assert launcher._job_bootstrap is None
 
@@ -1639,6 +1668,15 @@ def test_parse_databricks_without_job_bootstrap_leaves_direct_ssh() -> None:
                 "timeout_s": 0,
             },
             "job_bootstrap.timeout_s",
+        ),
+        (
+            {
+                "ssh_key_secret_scope": "s",
+                "ssh_key_secret_key": "k",
+                "workspace_notebook_path": "/p",
+                "payload_secret_scope": "   ",
+            },
+            "job_bootstrap.payload_secret_scope",
         ),
     ],
 )

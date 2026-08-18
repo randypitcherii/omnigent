@@ -1110,11 +1110,12 @@ def test_start_host_via_job_stages_the_argv_as_a_transient_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The token-bearing SSH argv is written to Secrets under the SAME
-    scope the operator registered the sandbox-gateway SSH key in (no
-    second scope to provision), and deleted again once the run reaches a
-    terminal state — bounding the token's exposure window to roughly the
-    job's own runtime rather than leaving it stranded indefinitely.
+    With no `payload_secret_scope` configured, the token-bearing SSH argv
+    is written to Secrets under the same scope the operator registered the
+    sandbox-gateway SSH key in (no second scope to provision), and deleted
+    again once the run reaches a terminal state — bounding the token's
+    exposure window to roughly the job's own runtime rather than leaving it
+    stranded indefinitely.
     """
     from databricks.sdk.service.jobs import RunResultState
 
@@ -1173,6 +1174,55 @@ def test_start_host_via_job_deletes_the_secret_even_on_job_failure(
 
     assert "exited 255" in str(exc.value)
     assert len(fake.secrets.delete_calls) == 1
+
+
+@pytest.mark.databricks
+def test_start_host_via_job_stages_the_argv_in_the_configured_payload_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A configured `payload_secret_scope` takes the transient argv secret —
+    both the write and the cleanup delete — while the key scope keeps
+    holding only the long-lived gateway key.
+
+    This is the least-privilege deployment shape: writing the payload needs
+    ``WRITE`` on whatever scope holds it, so pointing it at the key scope
+    means whoever launches can also overwrite the private key. Splitting
+    them keeps that grant down to ``READ`` on the key scope. The notebook
+    must read the payload from the same scope it was written to, or the job
+    fails looking for a secret that is not there.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    config = _job_bootstrap_config(payload_secret_scope="omnigent-sandbox-payload")
+    launcher = DatabricksSandboxLauncher(job_bootstrap=config)
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    put_scope, put_key, _value = fake.secrets.put_calls[0]
+    assert put_scope == "omnigent-sandbox-payload"
+    assert fake.secrets.delete_calls == [("omnigent-sandbox-payload", put_key)]
+    # The notebook resolves both secrets by scope name, so the payload read
+    # must follow the payload scope while the key read stays put.
+    notebook = fake.workspace.uploads[0][1].decode()
+    assert f'dbutils.secrets.get(scope="omnigent-sandbox-payload", key="{put_key}")' in notebook
+    assert (
+        f'dbutils.secrets.get(scope="{config.ssh_key_secret_scope}", '
+        f'key="{config.ssh_key_secret_key}")'
+    ) in notebook
 
 
 def _launch(launcher: DatabricksSandboxLauncher, sandbox_id: str, token: str) -> None:

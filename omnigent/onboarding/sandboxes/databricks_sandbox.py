@@ -398,6 +398,17 @@ class JobBootstrapConfig:
     per-run path derived from this and deletes it afterwards, so two
     concurrent launches can never race over one artifact."""
 
+    payload_secret_scope: str | None = None
+    """Scope the per-run connect payload (ssh argv + remote command) is
+    written to, defaulting to :attr:`ssh_key_secret_scope`.
+
+    Set this to a SEPARATE scope in any deployment that cares about least
+    privilege: writing the payload needs ``WRITE`` on whatever scope holds
+    it, and granting the coordinator ``WRITE`` on the scope that also holds
+    the long-lived private key lets the coordinator overwrite that key.
+    Split into two scopes and the coordinator needs only ``READ`` on the key
+    scope and ``WRITE`` on this one."""
+
     node_type_id: str = "m5d.large"
     """Classic-compute node type for the throwaway single-node cluster.
     Instance-store-backed on purpose: EBS-only families (``m4.large``) are
@@ -410,6 +421,17 @@ class JobBootstrapConfig:
 
     timeout_s: float = _JOB_BOOTSTRAP_TIMEOUT_S
     """Ceiling on job-run completion, dominated by cluster spin-up."""
+
+    @property
+    def payload_scope(self) -> str:
+        """
+        The scope the transient connect payload is written to and deleted from.
+
+        Falls back to :attr:`ssh_key_secret_scope` so a config that predates
+        the split keeps working — at the cost of the coordinator needing
+        ``WRITE`` on the scope holding the private key.
+        """
+        return self.payload_secret_scope or self.ssh_key_secret_scope
 
 
 def _drain_forward_output(
@@ -816,10 +838,16 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         Secret, created immediately before submission and deleted in a
         ``finally`` block once the run reaches a terminal state. This is a
         deliberate tradeoff, not a closed problem: the secret is readable by
-        anyone with read access to the workspace's default scope for the
+        anyone with read access to *job_bootstrap.payload_scope* for the
         run's lifetime (minutes), and a crash between "job submitted" and
         "job reached terminal state" leaves it stranded until the next
-        cleanup pass — see the module docstring's job-bootstrap section.
+        cleanup pass.
+
+        Writing it needs ``WRITE`` on that scope, which is why the payload
+        scope is configurable separately from the key scope: point them at
+        the same scope and whoever runs this can also overwrite the private
+        key below. Splitting them keeps that grant down to ``READ`` on the
+        key scope plus ``WRITE`` on a scope holding nothing durable.
 
         The SSH private key registered against the sandbox gateway
         (*job_bootstrap.ssh_key_secret_scope* / ``ssh_key_secret_key``) is
@@ -849,7 +877,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         argv_secret_key = f"job-bootstrap-argv-{run_key}"
         notebook_path = f"{job_bootstrap.workspace_notebook_path}-{run_key}"
         client.secrets.put_secret(
-            scope=job_bootstrap.ssh_key_secret_scope,
+            scope=job_bootstrap.payload_scope,
             key=argv_secret_key,
             string_value=json.dumps(
                 {
@@ -865,7 +893,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         notebook_source = _JOB_BOOTSTRAP_NOTEBOOK_TEMPLATE.format(
             ssh_key_scope=job_bootstrap.ssh_key_secret_scope,
             ssh_key_key=job_bootstrap.ssh_key_secret_key,
-            argv_scope=job_bootstrap.ssh_key_secret_scope,
+            argv_scope=job_bootstrap.payload_scope,
             argv_key=argv_secret_key,
             api_root=_LAKEBOX_API_ROOT,
             gateway_port=_SANDBOX_GATEWAY_PORT,
@@ -907,7 +935,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             # outcome, which is the thing the caller needs to see.
             for cleanup in (
                 lambda: client.secrets.delete_secret(
-                    scope=job_bootstrap.ssh_key_secret_scope, key=argv_secret_key
+                    scope=job_bootstrap.payload_scope, key=argv_secret_key
                 ),
                 lambda: client.workspace.delete(notebook_path),
             ):

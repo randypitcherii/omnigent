@@ -1909,6 +1909,11 @@ def _parse_databricks_job_bootstrap(
     path the launcher overwrites on every run — guessing at that would let a
     typo clobber someone's notebook.
 
+    *payload_secret_scope* is optional and defaults to the key scope. Setting
+    it to a second scope is what lets the coordinator hold ``READ`` (not
+    ``WRITE``) on the scope containing the gateway private key — see
+    :class:`~omnigent.onboarding.sandboxes.databricks_sandbox.JobBootstrapConfig`.
+
     :param section: The ``sandbox.databricks`` mapping, or ``None`` when the
         provider block is omitted entirely.
     :returns: The parsed config, or ``None`` when ``job_bootstrap`` is absent
@@ -1929,6 +1934,7 @@ def _parse_databricks_job_bootstrap(
         {
             "ssh_key_secret_scope",
             "ssh_key_secret_key",
+            "payload_secret_scope",
             "workspace_notebook_path",
             "node_type_id",
             "spark_version",
@@ -1962,7 +1968,7 @@ def _parse_databricks_job_bootstrap(
     from omnigent.onboarding.sandboxes.databricks_sandbox import JobBootstrapConfig
 
     overrides: dict[str, object] = {}
-    for key in ("node_type_id", "spark_version"):
+    for key in ("payload_secret_scope", "node_type_id", "spark_version"):
         value = _optional(key)
         if value is not None:
             overrides[key] = value
