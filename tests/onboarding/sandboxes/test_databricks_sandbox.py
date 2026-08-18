@@ -889,6 +889,80 @@ class _FakeApiClient:
 
 
 @dataclass
+class _FakeClusterWait:
+    """Stands in for the ``Wait`` ``clusters.create``/``start`` return."""
+
+    cluster: SimpleNamespace
+
+    def result(self, timeout: object = None) -> SimpleNamespace:
+        return self.cluster
+
+
+@dataclass
+class _FakeClusters:
+    """
+    Fakes the Clusters-API calls the warm-compute path makes.
+
+    :param existing: Clusters the workspace already has, as
+        ``(cluster_id, cluster_name, state)`` — ``state`` drives whether
+        the launcher must start or wait.
+    :param created_id: Cluster id the fake hands back from ``create``.
+    """
+
+    existing: list[tuple[str, str, Any]] = field(default_factory=list)
+    created_id: str = "created-cluster-id"
+    create_calls: list[dict[str, Any]] = field(default_factory=list)
+    start_calls: list[str] = field(default_factory=list)
+    get_calls: list[str] = field(default_factory=list)
+    wait_running_calls: list[str] = field(default_factory=list)
+    wait_terminated_calls: list[str] = field(default_factory=list)
+    list_calls: int = 0
+
+    def list(self) -> list[SimpleNamespace]:
+        self.list_calls += 1
+        return [
+            SimpleNamespace(cluster_id=cid, cluster_name=name, state=state)
+            for cid, name, state in self.existing
+        ]
+
+    def create(self, **kwargs: Any) -> _FakeClusterWait:
+        self.create_calls.append(kwargs)
+        from databricks.sdk.service.compute import State
+
+        self.existing.append((self.created_id, kwargs.get("cluster_name", ""), State.RUNNING))
+        return _FakeClusterWait(cluster=SimpleNamespace(cluster_id=self.created_id))
+
+    def get(self, cluster_id: str) -> SimpleNamespace:
+        self.get_calls.append(cluster_id)
+        for cid, name, state in self.existing:
+            if cid == cluster_id:
+                return SimpleNamespace(cluster_id=cid, cluster_name=name, state=state)
+        raise AssertionError(f"unexpected clusters.get for {cluster_id}")
+
+    def start(self, cluster_id: str) -> _FakeClusterWait:
+        self.start_calls.append(cluster_id)
+        from databricks.sdk.service.compute import State
+
+        self.existing = [
+            (cid, name, State.RUNNING if cid == cluster_id else state)
+            for cid, name, state in self.existing
+        ]
+        return _FakeClusterWait(cluster=SimpleNamespace(cluster_id=cluster_id))
+
+    def wait_get_cluster_running(self, cluster_id: str, timeout: object = None) -> None:
+        self.wait_running_calls.append(cluster_id)
+
+    def wait_get_cluster_terminated(self, cluster_id: str, timeout: object = None) -> None:
+        self.wait_terminated_calls.append(cluster_id)
+        from databricks.sdk.service.compute import State
+
+        self.existing = [
+            (cid, name, State.TERMINATED if cid == cluster_id else state)
+            for cid, name, state in self.existing
+        ]
+
+
+@dataclass
 class _FakeWorkspaceClient:
     """Stands in for ``databricks.sdk.WorkspaceClient``."""
 
@@ -897,6 +971,7 @@ class _FakeWorkspaceClient:
     workspace: _FakeWorkspace = field(default_factory=_FakeWorkspace)
     config: _FakeConfig = field(default_factory=_FakeConfig)
     api_client: _FakeApiClient = field(default_factory=_FakeApiClient)
+    clusters: _FakeClusters = field(default_factory=_FakeClusters)
 
     def get_workspace_id(self) -> int:
         """The org id the driver notebook needs to route to this workspace."""
@@ -904,19 +979,27 @@ class _FakeWorkspaceClient:
 
 
 def _install_job_bootstrap(
-    monkeypatch: pytest.MonkeyPatch, jobs: _FakeJobs | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    jobs: _FakeJobs | None = None,
+    clusters: _FakeClusters | None = None,
 ) -> _FakeWorkspaceClient:
     """
     Swap in a fake ``WorkspaceClient`` for ``_run_via_job``'s lazy import.
 
     :param jobs: A pre-configured `_FakeJobs`, or `None` for a canned
         successful run.
+    :param clusters: A pre-configured `_FakeClusters` for the warm-compute
+        path, or `None` for an empty workspace (the throwaway path never
+        touches it).
     :returns: The fake client backing the launcher's SDK calls.
     """
     import databricks.sdk
     from databricks.sdk.service.jobs import RunResultState
 
-    fake = _FakeWorkspaceClient(jobs=jobs or _FakeJobs(result_state=RunResultState.SUCCESS))
+    fake = _FakeWorkspaceClient(
+        jobs=jobs or _FakeJobs(result_state=RunResultState.SUCCESS),
+        clusters=clusters or _FakeClusters(),
+    )
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_kwargs: fake)
     return fake
 
@@ -1937,3 +2020,259 @@ def test_as_api_duration_rejects_what_it_cannot_read(value: str) -> None:
     """
     with pytest.raises(click.ClickException, match="idle timeout"):
         dbx._as_api_duration(value)
+
+
+# --- warm compute ------------------------------------------------------
+#
+# The throwaway per-run cluster costs a 3-6 minute cold start on EVERY
+# managed launch, which makes iterating on a bootstrap failure impractical.
+# Warm compute submits against a long-lived single-node cluster instead.
+# What these tests pin down is that it stays OPT-IN (an unconfigured
+# deployment submits exactly the `new_cluster` it always did) and that it
+# SELF-HEALS (a cluster that autoterminated between launches is restarted,
+# not reported as a submission failure).
+
+
+def test_job_bootstrap_config_defaults_to_throwaway_compute() -> None:
+    """
+    Warm compute must be opt-in: with neither selector set, `warm_compute`
+    is False and the launcher keeps submitting a per-run cluster.
+    """
+    assert _job_bootstrap_config().warm_compute is False
+    assert _job_bootstrap_config(cluster_name="warm").warm_compute is True
+    assert _job_bootstrap_config(existing_cluster_id="c-1").warm_compute is True
+
+
+def test_job_bootstrap_config_rejects_both_cluster_selectors() -> None:
+    """
+    An id pins an operator-managed cluster and a name hands the lifecycle to
+    the launcher; with both set one would have to silently lose, which is not
+    something a config author should have to guess at.
+    """
+    with pytest.raises(ValueError, match="not both"):
+        _job_bootstrap_config(cluster_name="warm", existing_cluster_id="c-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _job_bootstrap_config(cluster_name="warm", autotermination_minutes=-1)
+
+
+@pytest.mark.databricks
+def test_unconfigured_warm_compute_still_submits_a_throwaway_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The default path is unchanged: a per-run `new_cluster` spec, no
+    `existing_cluster_id`, and no Clusters-API traffic at all.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    task = fake.jobs.submit_calls[0]["tasks"][0]
+    assert task.new_cluster is not None
+    assert task.existing_cluster_id is None
+    assert fake.clusters.get_calls == []
+    assert fake.clusters.create_calls == []
+
+
+@pytest.mark.databricks
+def test_warm_compute_creates_the_named_cluster_then_submits_against_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    First launch in a workspace that has no such cluster: the launcher
+    creates it (single-node, never-autoterminate by default, tagged so an
+    operator can tell what owns it) and submits with `existing_cluster_id`
+    rather than a throwaway spec.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    clusters = _FakeClusters(created_id="warm-1")
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+        clusters=clusters,
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(cluster_name="omnigent-sandbox-bootstrap")
+    )
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    created = clusters.create_calls[0]
+    assert created["cluster_name"] == "omnigent-sandbox-bootstrap"
+    assert created["num_workers"] == 0
+    assert created["autotermination_minutes"] == 0
+    assert created["custom_tags"][dbx._WARM_CLUSTER_TAG_KEY] == dbx._WARM_CLUSTER_TAG_VALUE
+    task = fake.jobs.submit_calls[0]["tasks"][0]
+    assert task.existing_cluster_id == "warm-1"
+    assert task.new_cluster is None
+
+
+@pytest.mark.databricks
+def test_warm_compute_reuses_a_running_cluster_without_recreating_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The whole point of the warm path: when the cluster is already up, a
+    launch does no create and no start — it verifies state and submits.
+    """
+    from databricks.sdk.service.compute import State
+    from databricks.sdk.service.jobs import RunResultState
+
+    clusters = _FakeClusters(existing=[("warm-1", "warm", State.RUNNING)])
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+        clusters=clusters,
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config(cluster_name="warm"))
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert clusters.create_calls == []
+    assert clusters.start_calls == []
+    assert clusters.get_calls == ["warm-1"]
+    assert fake.jobs.submit_calls[0]["tasks"][0].existing_cluster_id == "warm-1"
+
+
+@pytest.mark.databricks
+def test_warm_compute_restarts_a_terminated_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cluster that autoterminated (or that an operator stopped) between
+    launches must be started, not reported as a broken launch path — the
+    reason state is re-checked every run instead of cached once.
+    """
+    from databricks.sdk.service.compute import State
+    from databricks.sdk.service.jobs import RunResultState
+
+    clusters = _FakeClusters(existing=[("warm-1", "warm", State.TERMINATED)])
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+        clusters=clusters,
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(existing_cluster_id="warm-1")
+    )
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert clusters.start_calls == ["warm-1"]
+    assert clusters.create_calls == []
+    assert fake.jobs.submit_calls[0]["tasks"][0].existing_cluster_id == "warm-1"
+
+
+@pytest.mark.databricks
+def test_warm_compute_waits_out_a_pending_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cluster another launch already started is joined, not started again —
+    a second `start` on a PENDING cluster is an API error.
+    """
+    from databricks.sdk.service.compute import State
+    from databricks.sdk.service.jobs import RunResultState
+
+    clusters = _FakeClusters(existing=[("warm-1", "warm", State.PENDING)])
+    _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+        clusters=clusters,
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(existing_cluster_id="warm-1")
+    )
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert clusters.wait_running_calls == ["warm-1"]
+    assert clusters.start_calls == []
+
+
+@pytest.mark.databricks
+def test_warm_compute_fails_fast_on_an_errored_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ERROR is not something waiting fixes, and the message must say what to
+    do about it rather than expiring the full timeout first.
+    """
+    from databricks.sdk.service.compute import State
+    from databricks.sdk.service.jobs import RunResultState
+
+    clusters = _FakeClusters(existing=[("warm-1", "warm", State.ERROR)])
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(result_state=RunResultState.SUCCESS),
+        clusters=clusters,
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(existing_cluster_id="warm-1")
+    )
+
+    with pytest.raises(click.ClickException, match="cannot be started"):
+        launcher.start_host(
+            "sb-1",
+            token="armed-token",
+            host_id="host-1",
+            host_name="host-name",
+            server_url="https://omnigent.example.com",
+        )
+
+    # Compute is readied BEFORE the payload is staged, so a compute failure
+    # never leaves the armed host token sitting in a workspace secret.
+    assert fake.secrets.put_calls == []
+    assert fake.jobs.submit_calls == []

@@ -69,6 +69,7 @@ import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import ClassVar
 
@@ -192,6 +193,19 @@ _WORKSPACE_TAG: str = "OMNIGENT_JOB_BOOTSTRAP_WORKSPACE="
 # (clone + host launch) is seconds. Generous enough to cover a slow cluster
 # start without letting a wedged run hang a managed launch indefinitely.
 _JOB_BOOTSTRAP_TIMEOUT_S: float = 900.0
+
+# Ceiling on getting a WARM bootstrap cluster to Running. Sized like the
+# throwaway path's ceiling because the worst case is the same work: a cold
+# create, or a restart of a cluster that autoterminated. The point of the warm
+# path is that only the first launch after a create/restart waits at all —
+# every launch while the cluster stays up skips straight to submission.
+_WARM_CLUSTER_READY_TIMEOUT_S: float = 900.0
+
+# Stamped on a launcher-created warm cluster. A long-lived cluster nobody
+# recognizes is a cluster someone deletes; this tells an operator scanning the
+# workspace's compute list what created it and what deleting it would break.
+_WARM_CLUSTER_TAG_KEY: str = "OmnigentSandboxBootstrap"
+_WARM_CLUSTER_TAG_VALUE: str = "warm-compute"
 
 # Sandbox control-plane REST surface, as used by the bootstrap notebook.
 # Mirrors `cmd/sandbox/api.go` in the Databricks CLI, whose `sandboxAPIRoot`
@@ -398,9 +412,18 @@ class JobBootstrapConfig:
     every remote step it would normally run itself (probe ``$HOME``,
     ``mkdir``, clone, write host config, launch ``omnigent host``) into ONE
     script and submits ONE job run that opens a single SSH session to run it
-    — one job-run round trip, not one per step. The job pays a cold
-    single-node cluster start (observed 3-6 minutes) on every managed launch;
-    that latency is the price of the routing gap.
+    — one job-run round trip, not one per step.
+
+    **Compute reuse is the difference between a usable and an unusable
+    iteration loop.** By default each run spins a throwaway single-node
+    cluster and pays that cold start (observed 3-6 minutes) on EVERY managed
+    launch — so a bootstrap that fails for a fixable reason costs minutes per
+    attempt. Set :attr:`cluster_name` (or :attr:`existing_cluster_id`) and
+    runs submit against a long-lived cluster instead: the spin-up is paid
+    once, and later runs start in seconds, which is what makes trying several
+    configurations in a row practical. The cost side of the trade is real —
+    the warm cluster is all-purpose compute that bills while it is up — and
+    :attr:`autotermination_minutes` is the dial for it.
 
     Both secrets this needs (the armed host token and an SSH private key
     registered against the sandbox gateway) travel through Databricks
@@ -447,10 +470,80 @@ class JobBootstrapConfig:
     declares EBS volumes, which this deliberately does not."""
 
     spark_version: str = "15.4.x-scala2.12"
-    """Databricks Runtime version for the throwaway cluster."""
+    """Databricks Runtime version for the cluster (throwaway or warm)."""
 
     timeout_s: float = _JOB_BOOTSTRAP_TIMEOUT_S
-    """Ceiling on job-run completion, dominated by cluster spin-up."""
+    """Ceiling on job-run completion. Dominated by cluster spin-up on the
+    throwaway path; on the warm path a run is just the SSH session, so the
+    same ceiling is generous rather than tight."""
+
+    existing_cluster_id: str | None = None
+    """Long-lived classic cluster to submit bootstrap runs against, e.g.
+    ``"0806-241456-abcd1234"`` — skipping the throwaway cluster's cold start.
+
+    Mutually exclusive with :attr:`cluster_name` (see :meth:`__post_init__`):
+    an id pins a cluster whose lifecycle an operator owns, a name hands the
+    lifecycle to the launcher. A pinned cluster is still RESTARTED when it is
+    found terminated, so pinning one does not turn "someone stopped it" into
+    a permanently broken launch path."""
+
+    cluster_name: str | None = None
+    """Name of a launcher-managed long-lived cluster, e.g.
+    ``"omnigent-sandbox-bootstrap"``.
+
+    The launcher resolves it by name, CREATES it when absent (single-node
+    classic, the same spec the throwaway path uses), and starts it when it is
+    found terminated. So the first launch pays a cold start and every later
+    one submits against a cluster that is already up. Prefer this over
+    :attr:`existing_cluster_id` unless an operator wants to own the cluster
+    themselves — it needs no out-of-band setup step to go wrong."""
+
+    autotermination_minutes: int = 0
+    """Idle minutes before a launcher-created warm cluster terminates itself;
+    ``0`` (the default) means never.
+
+    Never-terminate is the right default *for this path*: the whole point is
+    that a launch never waits on a cluster start, and an idle window
+    reintroduces exactly that wait at an unpredictable time. It also means
+    the cluster bills until something stops it, so a deployment that launches
+    rarely should set a real window and accept the occasional restart.
+    Applied only at CREATE time (and therefore only with
+    :attr:`cluster_name`) — the lifecycle of a cluster named by
+    :attr:`existing_cluster_id` belongs to whoever created it."""
+
+    def __post_init__(self) -> None:
+        """
+        Reject configurations whose intent cannot be recovered.
+
+        Both cluster selectors at once is the ambiguous case: one of them
+        would have to silently lose, and which one is not something a config
+        author should have to guess from reading the implementation.
+
+        :raises ValueError: When both warm-cluster selectors are set, or
+            *autotermination_minutes* is negative.
+        """
+        if self.existing_cluster_id is not None and self.cluster_name is not None:
+            raise ValueError(
+                "JobBootstrapConfig takes existing_cluster_id OR cluster_name, not both "
+                "— an id pins an operator-managed cluster, a name lets the launcher "
+                "manage one."
+            )
+        if self.autotermination_minutes < 0:
+            raise ValueError(
+                "JobBootstrapConfig.autotermination_minutes must be >= 0 (0 = never "
+                f"terminate), got {self.autotermination_minutes}."
+            )
+
+    @property
+    def warm_compute(self) -> bool:
+        """
+        Whether runs submit against a long-lived cluster.
+
+        ``False`` selects the throwaway ``new_cluster`` per run — the
+        unchanged default, and the only behavior available before either
+        cluster selector existed.
+        """
+        return self.existing_cluster_id is not None or self.cluster_name is not None
 
     @property
     def payload_scope(self) -> str:
@@ -713,6 +806,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         # Memoized lazily by `_sdk()`; the SDK is an optional extra, so it is
         # never imported on the direct-SSH path.
         self._client: object | None = None
+        # Resolved warm-cluster id, memoized so repeated launches skip the
+        # list-by-name lookup. Its RUNNING state is re-checked every run
+        # regardless -- see `_ensure_warm_cluster`.
+        self._warm_cluster_id: str | None = None
 
     def start_host(self, sandbox_id: str, **kwargs):  # type: ignore[override]
         """Run the configured bootstrap, then start the host as usual.
@@ -849,6 +946,154 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             f"cannot report the workspace path. Output: {output!r}"
         )
 
+    def _ensure_warm_cluster(self, job_bootstrap: JobBootstrapConfig) -> str | None:
+        """
+        Return the id of a RUNNING long-lived bootstrap cluster, or ``None``.
+
+        ``None`` means warm compute is not configured, and the caller falls
+        back to the throwaway per-run cluster — so every existing deployment
+        keeps its current behavior until it opts in.
+
+        The resolved id is memoized, but its state is re-checked on **every**
+        run rather than trusted once. That is the difference between a warm
+        path that self-heals and one that breaks quietly: a cluster can
+        autoterminate, be stopped by an operator, or be restarted by the
+        platform between launches, and a cached "it was running" would turn
+        each of those into a confusing job-submission failure. When the
+        cluster is already up the re-check costs one ``clusters.get``, which
+        is nothing against the SSH session that follows.
+
+        :returns: Cluster id when warm compute is configured, else ``None``.
+        :raises click.ClickException: When the cluster cannot be brought to a
+            RUNNING state.
+        """
+        if not job_bootstrap.warm_compute:
+            return None
+        cluster_id = self._warm_cluster_id or job_bootstrap.existing_cluster_id
+        if cluster_id is None:
+            cluster_id = self._resolve_named_cluster(job_bootstrap)
+        self._warm_cluster_id = cluster_id
+        self._await_cluster_running(cluster_id)
+        return cluster_id
+
+    def _resolve_named_cluster(self, job_bootstrap: JobBootstrapConfig) -> str:
+        """
+        Find the warm cluster by name, creating it when it does not exist.
+
+        Resolving by name rather than id is what lets a deployment declare
+        the warm cluster in config alone, with no out-of-band setup step that
+        can be forgotten or done differently in another workspace.
+
+        :returns: The cluster id.
+        :raises click.ClickException: When the cluster cannot be listed or created.
+        """
+        name = job_bootstrap.cluster_name
+        assert name is not None  # guaranteed by `warm_compute` + `_ensure_warm_cluster`
+        client = self._sdk()
+        try:
+            for cluster in client.clusters.list():
+                if cluster.cluster_name == name and cluster.cluster_id is not None:
+                    logger.info("reusing warm bootstrap cluster %s (%s)", name, cluster.cluster_id)
+                    return cluster.cluster_id
+        except Exception as error:
+            raise click.ClickException(
+                f"Could not list Databricks clusters to find warm bootstrap "
+                f"cluster {name!r}: {error}"
+            ) from error
+        return self._create_warm_cluster(job_bootstrap, name)
+
+    def _create_warm_cluster(self, job_bootstrap: JobBootstrapConfig, name: str) -> str:
+        """
+        Create the long-lived single-node bootstrap cluster and wait for it.
+
+        Same single-node classic spec the throwaway path submits — the point
+        of this path is the cluster's lifetime, not a different shape of
+        machine. It is tagged (:data:`_WARM_CLUSTER_TAG_KEY`) because a
+        long-lived cluster nobody recognizes is a long-lived cluster somebody
+        deletes.
+
+        :returns: The new cluster id.
+        :raises click.ClickException: When creation fails or times out.
+        """
+        client = self._sdk()
+        logger.info("creating warm bootstrap cluster %s", name)
+        try:
+            created = client.clusters.create(
+                cluster_name=name,
+                spark_version=job_bootstrap.spark_version,
+                node_type_id=job_bootstrap.node_type_id,
+                num_workers=0,
+                autotermination_minutes=job_bootstrap.autotermination_minutes,
+                spark_conf={
+                    "spark.master": "local[*]",
+                    "spark.databricks.cluster.profile": "singleNode",
+                },
+                custom_tags={
+                    "ResourceClass": "SingleNode",
+                    _WARM_CLUSTER_TAG_KEY: _WARM_CLUSTER_TAG_VALUE,
+                },
+            ).result(timeout=timedelta(seconds=_WARM_CLUSTER_READY_TIMEOUT_S))
+        except Exception as error:
+            raise click.ClickException(
+                f"Could not create warm bootstrap cluster {name!r}: {error}"
+            ) from error
+        cluster_id = created.cluster_id
+        if cluster_id is None:
+            raise click.ClickException(
+                f"Databricks reported no cluster id for created warm bootstrap cluster {name!r}."
+            )
+        return cluster_id
+
+    def _await_cluster_running(self, cluster_id: str) -> None:
+        """
+        Bring *cluster_id* to RUNNING, starting or waiting as its state requires.
+
+        Every non-running state is handled explicitly rather than blanket
+        "call start": starting an already-starting cluster is an error, and a
+        TERMINATING cluster must finish terminating before a start is
+        accepted. The one state worth failing fast on is ERROR — waiting out
+        the full timeout on a cluster that cannot start just delays the
+        message the operator needs.
+
+        :raises click.ClickException: When the cluster ends up unusable or
+            takes longer than :data:`_WARM_CLUSTER_READY_TIMEOUT_S`.
+        """
+        from databricks.sdk.service.compute import State
+
+        client = self._sdk()
+        timeout = timedelta(seconds=_WARM_CLUSTER_READY_TIMEOUT_S)
+        unusable: str | None = None
+        try:
+            state = client.clusters.get(cluster_id).state
+            if state == State.RUNNING:
+                return
+            if state == State.TERMINATING:
+                # A start submitted mid-termination is rejected, so let the
+                # termination land first and then start from a clean state.
+                client.clusters.wait_get_cluster_terminated(cluster_id, timeout=timeout)
+                state = State.TERMINATED
+            if state == State.TERMINATED:
+                logger.info("starting warm bootstrap cluster %s", cluster_id)
+                client.clusters.start(cluster_id).result(timeout=timeout)
+                return
+            if state in (State.PENDING, State.RESTARTING, State.RESIZING):
+                # Another launch (or an operator) already started it; joining
+                # that wait is correct where a second start would error.
+                client.clusters.wait_get_cluster_running(cluster_id, timeout=timeout)
+                return
+            unusable = str(getattr(state, "value", state))
+        except Exception as error:
+            raise click.ClickException(
+                f"Warm bootstrap cluster {cluster_id} did not reach a running state: {error}"
+            ) from error
+        # Raised outside the `try` on purpose: inside, the `except` above
+        # would catch it and rewrite the specific diagnosis into a generic one.
+        raise click.ClickException(
+            f"Warm bootstrap cluster {cluster_id} is in state {unusable}, which cannot be "
+            "started. Inspect it in the workspace, then delete it (the launcher recreates a "
+            "cluster it manages by name) or point job_bootstrap at a healthy cluster."
+        )
+
     def _run_via_job(
         self,
         job_bootstrap: JobBootstrapConfig,
@@ -893,6 +1138,11 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         loser would execute the winner's notebook — pointed at the winner's
         payload secret, and therefore at the wrong sandbox.
 
+        Compute is either the throwaway per-run cluster or, when the config
+        selects warm compute, an already-running long-lived one — see
+        :meth:`_ensure_warm_cluster`. Nothing else about the run differs; the
+        notebook, payload, and cleanup are identical either way.
+
         :param redact: Strings (the armed host token) scrubbed from anything
             the notebook returns, because notebook output is durable job-run
             JSON readable by anyone with job-read access.
@@ -904,6 +1154,12 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         from databricks.sdk.service.workspace import ImportFormat, Language
 
         client = self._sdk()
+        # Deliberately BEFORE the payload write. Getting compute ready can
+        # take minutes (a cold create, or a restart of a cluster that
+        # autoterminated), and the payload holds the armed host token --
+        # staging it first would leave the token readable in the workspace
+        # for that whole window for no benefit.
+        warm_cluster_id = self._ensure_warm_cluster(job_bootstrap)
         run_key = uuid.uuid4().hex
         argv_secret_key = f"job-bootstrap-argv-{run_key}"
         notebook_path = f"{job_bootstrap.workspace_notebook_path}-{run_key}"
@@ -952,24 +1208,33 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 language=Language.PYTHON,
                 overwrite=True,
             )
+            # Warm path: submit against the already-running cluster
+            # resolved above. Throwaway path: the unchanged per-run cluster,
+            # which is what makes the warm fields purely additive.
+            if warm_cluster_id is not None:
+                task = SubmitTask(
+                    task_key="bootstrap",
+                    notebook_task=NotebookTask(notebook_path=notebook_path),
+                    existing_cluster_id=warm_cluster_id,
+                )
+            else:
+                task = SubmitTask(
+                    task_key="bootstrap",
+                    notebook_task=NotebookTask(notebook_path=notebook_path),
+                    new_cluster=ClusterSpec(
+                        spark_version=job_bootstrap.spark_version,
+                        node_type_id=job_bootstrap.node_type_id,
+                        num_workers=0,
+                        spark_conf={
+                            "spark.master": "local[*]",
+                            "spark.databricks.cluster.profile": "singleNode",
+                        },
+                        custom_tags={"ResourceClass": "SingleNode"},
+                    ),
+                )
             waiter = client.jobs.submit(
                 run_name="omnigent-sandbox-job-bootstrap",
-                tasks=[
-                    SubmitTask(
-                        task_key="bootstrap",
-                        notebook_task=NotebookTask(notebook_path=notebook_path),
-                        new_cluster=ClusterSpec(
-                            spark_version=job_bootstrap.spark_version,
-                            node_type_id=job_bootstrap.node_type_id,
-                            num_workers=0,
-                            spark_conf={
-                                "spark.master": "local[*]",
-                                "spark.databricks.cluster.profile": "singleNode",
-                            },
-                            custom_tags={"ResourceClass": "SingleNode"},
-                        ),
-                    )
-                ],
+                tasks=[task],
                 timeout_seconds=int(job_bootstrap.timeout_s),
             )
             run = waiter.result()

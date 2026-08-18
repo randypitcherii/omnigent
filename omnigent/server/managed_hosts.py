@@ -1920,6 +1920,13 @@ def _parse_databricks_job_bootstrap(
     ``WRITE``) on the scope containing the gateway private key — see
     :class:`~omnigent.onboarding.sandboxes.databricks_sandbox.JobBootstrapConfig`.
 
+    *cluster_name* / *existing_cluster_id* opt into warm compute: bootstrap
+    runs submit against a long-lived single-node cluster instead of paying a
+    3-6 minute cold start per launch. Both are optional and mutually
+    exclusive; prefer *cluster_name*, which the launcher creates and starts on
+    demand. *autotermination_minutes* (default ``0``, never) bounds what a
+    launcher-created cluster costs while idle.
+
     :param section: The ``sandbox.databricks`` mapping, or ``None`` when the
         provider block is omitted entirely.
     :returns: The parsed config, or ``None`` when ``job_bootstrap`` is absent
@@ -1945,6 +1952,9 @@ def _parse_databricks_job_bootstrap(
             "node_type_id",
             "spark_version",
             "timeout_s",
+            "existing_cluster_id",
+            "cluster_name",
+            "autotermination_minutes",
         },
         "sandbox.databricks.job_bootstrap",
     )
@@ -1974,7 +1984,13 @@ def _parse_databricks_job_bootstrap(
     from omnigent.onboarding.sandboxes.databricks_sandbox import JobBootstrapConfig
 
     overrides: dict[str, object] = {}
-    for key in ("payload_secret_scope", "node_type_id", "spark_version"):
+    for key in (
+        "payload_secret_scope",
+        "node_type_id",
+        "spark_version",
+        "existing_cluster_id",
+        "cluster_name",
+    ):
         value = _optional(key)
         if value is not None:
             overrides[key] = value
@@ -1990,13 +2006,27 @@ def _parse_databricks_job_bootstrap(
                 "must be a positive number"
             )
         overrides["timeout_s"] = float(timeout_s)
+    idle_minutes = block.get("autotermination_minutes")
+    if idle_minutes is not None:
+        if not isinstance(idle_minutes, int) or isinstance(idle_minutes, bool) or idle_minutes < 0:
+            raise ValueError(
+                "server config 'sandbox.databricks.job_bootstrap.autotermination_minutes' "
+                "must be a non-negative integer (0 = never terminate)"
+            )
+        overrides["autotermination_minutes"] = idle_minutes
 
-    return JobBootstrapConfig(
-        ssh_key_secret_scope=_required("ssh_key_secret_scope"),
-        ssh_key_secret_key=_required("ssh_key_secret_key"),
-        workspace_notebook_path=_required("workspace_notebook_path"),
-        **overrides,  # type: ignore[arg-type]
-    )
+    # `JobBootstrapConfig.__post_init__` rejects both cluster selectors at
+    # once; re-raised as the config error it is, so an operator reads it as a
+    # problem with their YAML rather than an internal failure.
+    try:
+        return JobBootstrapConfig(
+            ssh_key_secret_scope=_required("ssh_key_secret_scope"),
+            ssh_key_secret_key=_required("ssh_key_secret_key"),
+            workspace_notebook_path=_required("workspace_notebook_path"),
+            **overrides,  # type: ignore[arg-type]
+        )
+    except ValueError as error:
+        raise ValueError(f"server config 'sandbox.databricks.job_bootstrap': {error}") from error
 
 
 def _databricks_launcher_factory(

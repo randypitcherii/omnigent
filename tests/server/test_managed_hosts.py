@@ -1619,6 +1619,84 @@ def test_parse_databricks_job_bootstrap_payload_scope_defaults_to_the_key_scope(
     assert bootstrap.payload_scope == "omnigent-sandbox-bootstrap"
 
 
+def test_parse_databricks_job_bootstrap_accepts_warm_compute() -> None:
+    """
+    ``cluster_name`` / ``autotermination_minutes`` opt the deployment into a
+    long-lived bootstrap cluster, so launches stop paying a 3-6 minute cold
+    start each. Both must survive the parser's allow-list gate.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://s.example.com",
+            "databricks": {
+                "job_bootstrap": {
+                    "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
+                    "ssh_key_secret_key": "sandbox-ssh-private-key",
+                    "workspace_notebook_path": "/Users/me/omnigent/bootstrap",
+                    "cluster_name": "omnigent-sandbox-bootstrap",
+                    "autotermination_minutes": 120,
+                },
+            },
+        }
+    )
+
+    assert cfg is not None
+    bootstrap = cfg.default.launcher_factory()._job_bootstrap  # type: ignore[attr-defined]
+    assert bootstrap is not None
+    assert bootstrap.cluster_name == "omnigent-sandbox-bootstrap"
+    assert bootstrap.autotermination_minutes == 120
+    assert bootstrap.warm_compute is True
+
+
+def test_parse_databricks_job_bootstrap_defaults_to_throwaway_compute() -> None:
+    """Warm compute stays opt-in: no cluster keys means the per-run cluster."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://s.example.com",
+            "databricks": {
+                "job_bootstrap": {
+                    "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
+                    "ssh_key_secret_key": "sandbox-ssh-private-key",
+                    "workspace_notebook_path": "/Users/me/omnigent/bootstrap",
+                },
+            },
+        }
+    )
+
+    assert cfg is not None
+    bootstrap = cfg.default.launcher_factory()._job_bootstrap  # type: ignore[attr-defined]
+    assert bootstrap is not None
+    assert bootstrap.warm_compute is False
+
+
+def test_parse_databricks_job_bootstrap_rejects_bad_warm_compute() -> None:
+    """
+    Both cluster selectors at once is ambiguous, and a negative idle window is
+    meaningless — each must fail as a config error naming the block, not as an
+    obscure failure on the first launch.
+    """
+    base = {
+        "ssh_key_secret_scope": "omnigent-sandbox-bootstrap",
+        "ssh_key_secret_key": "sandbox-ssh-private-key",
+        "workspace_notebook_path": "/Users/me/omnigent/bootstrap",
+    }
+    for bad, message in (
+        ({"cluster_name": "warm", "existing_cluster_id": "c-1"}, "not both"),
+        ({"autotermination_minutes": -5}, "non-negative integer"),
+        ({"autotermination_minutes": "sixty"}, "non-negative integer"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            parse_sandbox_config(
+                {
+                    "provider": "databricks",
+                    "server_url": "https://s.example.com",
+                    "databricks": {"job_bootstrap": {**base, **bad}},
+                }
+            )
+
+
 def test_parse_databricks_without_job_bootstrap_leaves_direct_ssh() -> None:
     """Omitting the block keeps the direct-SSH path, for a server that can
     actually route to the gateway (a laptop, not an App container)."""
