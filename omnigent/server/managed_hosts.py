@@ -151,6 +151,7 @@ import logging
 import posixpath
 import re
 import secrets
+import shlex
 import time
 import uuid
 from collections.abc import Callable
@@ -281,6 +282,11 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # Where the in-sandbox host process logs — named in launch-failure
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
+
+# How much of that log rides along in a launch-failure error. The log is read
+# off the sandbox before teardown (see _host_log_tail) and lands in an HTTP
+# error detail, so it has to be bounded — the tail is where the failure is.
+_HOST_LOG_TAIL_LINES = 50
 
 # How long a message POST waits for an in-flight managed launch to
 # settle before giving up (see ManagedLaunchTracker). Covers the full
@@ -3049,6 +3055,13 @@ async def _arm_and_start_host(
         # or the sandbox leaks running until the provider's lifetime
         # cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
+        #
+        # Read the host log BEFORE teardown: the sandbox holding it is about
+        # to be destroyed, and on the registration-timeout path that log is
+        # the only evidence of why the host process never dialed in. Telling
+        # an operator to "check /tmp/omnigent-host.log inside the sandbox"
+        # names a file that no longer exists by the time they read the error.
+        log_tail = await _host_log_tail(launcher, sandbox_id)
         if keep_host_on_failure:
             await _terminate_sandbox_best_effort(launcher, record)
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
@@ -3059,13 +3072,61 @@ async def _arm_and_start_host(
                 record, host_store, ManagedSandboxDeployment.single(config)
             )
         if isinstance(exc, HTTPException):
-            raise
+            # Re-raise rather than mutate: the same detail string is what the
+            # caller's own error surfaces carry, and appending in place would
+            # edit an exception another frame may already have inspected.
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"{exc.detail}{log_tail}",
+            ) from exc
         message = exc.message if isinstance(exc, click.ClickException) else str(exc)
         raise HTTPException(
             status_code=502,
-            detail=f"managed sandbox host startup failed: {message}",
+            detail=f"managed sandbox host startup failed: {message}{log_tail}",
         ) from exc
     return workspace
+
+
+async def _host_log_tail(launcher: SandboxHostLauncher, sandbox_id: str) -> str:
+    """
+    Best-effort read of the in-sandbox host log, for attaching to a failure.
+
+    Called on the launch-failure path only, and always before teardown. Every
+    failure mode here is swallowed: this runs while an error is already being
+    reported, so a provider that cannot exec (entrypoint-model launchers have
+    no :meth:`run` at all), a sandbox already gone, or a log that was never
+    written must not replace the real error with a diagnostic one.
+
+    Cost is the provider's: on a launcher whose exec transport is itself
+    expensive (the Databricks job-delegated path spins a classic cluster per
+    command) this adds minutes to an already-failing launch, bounded by that
+    provider's own exec timeout. The enriched error is still worth it — it
+    lands durably on the session's ``sandbox_status.error`` even when the
+    caller's wait has already expired.
+
+    :param launcher: The launcher holding the sandbox — used only when it
+        offers exec transport.
+    :param sandbox_id: The sandbox whose log to read.
+    :returns: A blank-line-separated, labeled block ready to append to an
+        error detail, or ``""`` when no log could be read.
+    """
+    # Imported here, not at module scope: this module keeps the sandbox
+    # package out of its import graph (see the TYPE_CHECKING block) so the
+    # server starts without the optional provider extras installed.
+    from omnigent.onboarding.sandboxes.base import SandboxExecTransport
+
+    if not isinstance(launcher, SandboxExecTransport):
+        return ""
+    command = f"tail -n {_HOST_LOG_TAIL_LINES} {shlex.quote(_HOST_LOG_PATH)}"
+    try:
+        result = await asyncio.to_thread(launcher.run, sandbox_id, command, check=False)
+    except Exception as error:  # noqa: BLE001 — diagnostics never mask the real error
+        _logger.warning("could not read %s from sandbox %s: %s", _HOST_LOG_PATH, sandbox_id, error)
+        return ""
+    tail = result.stdout.strip()
+    if not tail:
+        return ""
+    return f"\n\n--- last {_HOST_LOG_TAIL_LINES} lines of {_HOST_LOG_PATH} ---\n{tail}"
 
 
 async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:

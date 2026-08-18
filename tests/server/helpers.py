@@ -152,6 +152,10 @@ class FakeSandboxLauncher(SandboxLauncher):
         command raise ``click.ClickException``, e.g. ``"git clone"``
         (simulates an in-sandbox command failing). ``None`` disables.
     :param home: ``$HOME`` the fake sandbox reports, e.g. ``"/root"``.
+    :param host_log: Content a ``tail`` of the in-sandbox host log returns —
+        what the launch-failure path reads off the sandbox before teardown.
+        ``None`` reports an empty log (the pre-existing behavior: no
+        diagnostic block is appended to the failure).
     :param can_resume: Whether this fake advertises in-place sandbox resume.
     :param fail_on_resume: When ``True``, ``resume`` raises
         ``click.ClickException``.
@@ -172,6 +176,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         fail_on_host_start: bool = False,
         fail_on_command: str | None = None,
         home: str = "/root",
+        host_log: str | None = None,
         can_resume: bool = False,
         fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
@@ -182,6 +187,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.fail_on_host_start = fail_on_host_start
         self._fail_on_command = fail_on_command
         self._home = home
+        self._host_log = host_log
         self.can_resume = can_resume
         self.fail_on_resume = fail_on_resume
         self._provision_gate = provision_gate
@@ -252,11 +258,20 @@ class FakeSandboxLauncher(SandboxLauncher):
 
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """Record the command and answer the managed flow's probes."""
+        # A terminated sandbox cannot be exec'd into. Asserting it here is what
+        # makes ordering testable: the failure path's host-log read must land
+        # BEFORE teardown, and a regression that reorders them fails loudly
+        # instead of silently returning an empty log.
+        assert sandbox_id not in self.terminated, (
+            f"cannot run a command on terminated sandbox '{sandbox_id}'"
+        )
         self.commands.append(command)
         if self._fail_on_command is not None and self._fail_on_command in command:
             raise click.ClickException(f"simulated failure of: {command}")
         if 'printf %s "$HOME"' in command:
             return RemoteCommandResult(returncode=0, stdout=self._home, stderr="")
+        if command.startswith("tail ") and "/tmp/omnigent-host.log" in command:
+            return RemoteCommandResult(returncode=0, stdout=self._host_log or "", stderr="")
         if "omnigent host" in command:
             if self.fail_on_host_start:
                 raise click.ClickException("simulated in-sandbox host start failure")

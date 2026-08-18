@@ -2309,6 +2309,97 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
     )
 
 
+async def test_launch_online_timeout_attaches_the_host_log_before_teardown(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The registration timeout carries the in-sandbox host log with it.
+
+    The old error told an operator to check a file inside a sandbox the same
+    failure path had just destroyed — unreadable by construction. The log is
+    now read off the sandbox BEFORE teardown (the fake asserts that ordering)
+    and its tail rides along in the 502 detail, which is the only place the
+    reason a host never registered can still be seen.
+    """
+    fake = FakeSandboxLauncher(host_log="Traceback: could not resolve omnigent server host\n")
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("omnigent.server.managed_hosts._ONLINE_POLL_INTERVAL_S", 0.01)
+    host_store = HostStore(db_uri)
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+    assert exc.value.status_code == 502
+    assert "did not come online" in exc.value.detail
+    assert "/tmp/omnigent-host.log" in exc.value.detail
+    assert "could not resolve omnigent server host" in exc.value.detail
+    # Read from the live sandbox, then torn down — not the other way around.
+    assert any(command.startswith("tail ") for command in fake.commands)
+    assert fake.terminated == ["sb-fake-1"]
+
+
+async def test_launch_failure_without_a_host_log_reports_the_error_alone(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An empty (or unreadable) host log adds nothing to the failure detail.
+
+    The read is diagnostic and best-effort: when the host process never got
+    far enough to write a line, the operator must still see the real error
+    rather than an empty log block implying one was found.
+    """
+    fake = FakeSandboxLauncher()
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("omnigent.server.managed_hosts._ONLINE_POLL_INTERVAL_S", 0.01)
+    host_store = HostStore(db_uri)
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+    assert "did not come online" in exc.value.detail
+    assert "last 50 lines" not in exc.value.detail
+
+
+async def test_launch_failure_survives_an_unreadable_host_log(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A host-log read that BLOWS UP must not replace the real failure.
+
+    The sandbox may already be gone, or the provider's exec transport may be
+    the very thing that broke. Diagnostics run while an error is being
+    reported, so their own failure is logged and dropped — the launch error
+    and the teardown both still happen.
+    """
+    fake = FakeSandboxLauncher()
+
+    # Only the diagnostic read explodes: the launch's own commands ($HOME
+    # probe, host start) must still succeed so the failure under test is the
+    # registration timeout, not an earlier startup error.
+    real_run = fake.run
+
+    def _explode_on_tail(sandbox_id: str, command: str, **kwargs: object):
+        if command.startswith("tail "):
+            raise RuntimeError("exec transport is gone")
+        return real_run(sandbox_id, command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("omnigent.server.managed_hosts._ONLINE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(fake, "run", _explode_on_tail)
+    host_store = HostStore(db_uri)
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+    assert "did not come online" in exc.value.detail
+    assert "exec transport is gone" not in exc.value.detail
+    assert fake.terminated == ["sb-fake-1"]
+    assert host_store.list_hosts(_OWNER) == []
+
+
 async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
     """
     A repository-URL workspace is cloned inside the sandbox BEFORE the

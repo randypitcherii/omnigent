@@ -1479,6 +1479,70 @@ def test_start_host_via_job_raises_when_output_has_no_workspace_tag(
         )
 
 
+@pytest.mark.databricks
+def test_run_is_delegated_to_a_job_when_job_bootstrap_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With `job_bootstrap` set, ALL transport goes through the job — not just
+    the bootstrap. A process that cannot reach the gateway on port 2222
+    cannot reach it for a one-off command either, so an app-side diagnostic
+    read (the server pulls /tmp/omnigent-host.log off a sandbox before
+    tearing it down) has to ride the same classic-compute detour.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output="omnigent host: connection refused\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    result = launcher.run("sb-1", "tail -n 50 /tmp/omnigent-host.log")
+
+    assert result.returncode == 0
+    assert "connection refused" in result.stdout
+    # The command reached the notebook as its remote command, via the payload
+    # secret — never as a job parameter.
+    payload = json.loads(fake.secrets.put_calls[0][2])
+    assert payload["remote_command"] == "tail -n 50 /tmp/omnigent-host.log"
+    assert payload["sandbox_id"] == "sb-1"
+
+
+@pytest.mark.databricks
+def test_delegated_run_reports_a_failed_job_as_a_nonzero_result_when_unchecked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `check=False` means "tell me it failed", not "raise anyway".
+
+    The job path cannot recover the remote command's own exit code — a
+    non-zero remote exit fails the whole run — so a failure maps to
+    `returncode=1` with the job error in stderr. Callers on the failure
+    path (the pre-teardown log read) depend on this: an exception there
+    would mask the launch error they are trying to explain.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(result_state=RunResultState.FAILED, notebook_output=""),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    result = launcher.run("sb-1", "tail -n 50 /tmp/omnigent-host.log", check=False)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr
+
+    with pytest.raises(click.ClickException):
+        launcher.run("sb-1", "tail -n 50 /tmp/omnigent-host.log")
+
+
 def test_start_host_without_job_bootstrap_ssh_directly_as_before(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

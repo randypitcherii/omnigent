@@ -1463,6 +1463,14 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         are reported faithfully rather than merged into ``stdout`` the
         way the SDK-backed providers must.
 
+        When ``job_bootstrap`` is configured, the command is delegated to a
+        one-shot classic-compute job exactly like the bootstrap is, because
+        this process cannot reach the sandbox gateway on port 2222 — see
+        :meth:`_run_via_job`. That path cannot separate the remote exit code
+        from the job's own outcome (a non-zero remote exit fails the job), so
+        it reports a remote failure as ``returncode=1`` with the job error in
+        ``stderr`` rather than inventing a specific exit code.
+
         :param sandbox_id: Target sandbox.
         :param command: Shell command to execute remotely; quote remote
             paths yourself, per the base contract.
@@ -1471,6 +1479,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         :raises click.ClickException: If *check* is ``True`` and the
             command exits non-zero.
         """
+        if self._job_bootstrap is not None:
+            return self._run_via_job_as_command(
+                self._job_bootstrap, sandbox_id, command, check=check
+            )
         completed = self._cli(
             self._ssh_argv(sandbox_id, command),
             timeout=_REMOTE_COMMAND_TIMEOUT_S,
@@ -1493,6 +1505,39 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             stdout=completed.stdout,
             stderr=completed.stderr,
         )
+
+    def _run_via_job_as_command(
+        self,
+        job_bootstrap: JobBootstrapConfig,
+        sandbox_id: str,
+        command: str,
+        *,
+        check: bool,
+    ) -> RemoteCommandResult:
+        """
+        Adapt :meth:`_run_via_job` to the :meth:`run` contract.
+
+        The job wrapper raises on any failure — remote non-zero exit, job
+        error, timeout — so honoring ``check=False`` means catching that and
+        mapping it onto a result. The mapping is deliberately coarse (see
+        :meth:`run`): the remote command's own exit code is not recoverable
+        from the job run, so callers that need it must not use this path.
+
+        :param job_bootstrap: The configured job-delegation settings.
+        :param sandbox_id: Target sandbox.
+        :param command: Shell command to execute remotely.
+        :param check: When ``True``, let the job failure propagate.
+        :returns: The job task's captured stdout on success; a synthetic
+            failure result carrying the job error when *check* is ``False``.
+        :raises click.ClickException: If *check* is ``True`` and the job fails.
+        """
+        try:
+            output = self._run_via_job(job_bootstrap, sandbox_id, command)
+        except click.ClickException as exc:
+            if check:
+                raise
+            return RemoteCommandResult(returncode=1, stdout="", stderr=exc.message)
+        return RemoteCommandResult(returncode=0, stdout=output, stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """
