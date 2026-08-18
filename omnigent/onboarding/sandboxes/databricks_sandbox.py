@@ -207,6 +207,17 @@ _WARM_CLUSTER_READY_TIMEOUT_S: float = 900.0
 _WARM_CLUSTER_TAG_KEY: str = "OmnigentSandboxBootstrap"
 _WARM_CLUSTER_TAG_VALUE: str = "warm-compute"
 
+# Databricks Apps hostname suffix. A server URL on this host is fronted by the
+# Apps OAuth edge, which answers HTTP 302 to anything but a workspace OAuth
+# token -- and a sandbox holds a workspace PAT, not an OAuth token. See
+# `_dial_back_url`.
+_APPS_HOST_SUFFIX: str = ".databricksapps.com"
+
+# The same server, reachable as a workspace API mount. Accepts a workspace PAT
+# normally, and `_resolve_server_url` in the CLI already treats it as the
+# canonical form of a Databricks-hosted Omnigent server.
+_WORKSPACE_API_PATH: str = "/api/2.0/omnigent"
+
 # Sandbox control-plane REST surface, as used by the bootstrap notebook.
 # Mirrors `cmd/sandbox/api.go` in the Databricks CLI, whose `sandboxAPIRoot`
 # still says "lakebox" because the server-side rename is pending.
@@ -826,12 +837,90 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         one script and handed to a classic-compute job to run over SSH,
         because THIS process (typically inside a Databricks App) cannot
         reach the sandbox gateway on port 2222.
+
+        ``server_url`` is rewritten first when it names a Databricks Apps
+        host, on both paths -- see :meth:`_dial_back_url`.
         """
+        server_url = kwargs.get("server_url")
+        if isinstance(server_url, str):
+            kwargs["server_url"] = self._dial_back_url(server_url)
         if self._job_bootstrap is not None:
             return self._start_host_via_job(sandbox_id, self._job_bootstrap, **kwargs)
         if self._bootstrap_command:
             self.run(sandbox_id, self._bootstrap_command)
         return super().start_host(sandbox_id, **kwargs)
+
+    def _dial_back_url(self, server_url: str) -> str:
+        """
+        Translate a Databricks Apps server URL to its workspace API mount.
+
+        A sandbox authenticates as its owner with the ambient workspace PAT
+        the platform mounts at ``/run/lakebox/databrickscfg`` -- it holds no
+        workspace OAuth token and cannot mint one (the in-sandbox
+        ``databricks auth login`` flow needs a browser). The Apps OAuth edge
+        answers HTTP 302 to a PAT, so an ``omnigent host`` pointed at the
+        ``*.databricksapps.com`` hostname dies on its ``/v1/me`` pre-flight
+        before it can ever register, and the managed launch fails with a
+        registration timeout. The SAME server answered through the workspace
+        API mount accepts that PAT and carries the full host tunnel.
+
+        So the operator still configures ``sandbox.server_url`` as the app's
+        public URL -- the honest answer to "where is this server?" -- and this
+        provider rewrites it to the one form its sandboxes can authenticate
+        against. Any other URL (a workspace mount already, a non-Databricks
+        host, a local server) is returned untouched.
+
+        :param server_url: The configured dial-back URL, e.g.
+            ``"https://omnigent-dev-123.aws.databricksapps.com"``.
+        :returns: The URL the in-sandbox host should dial, e.g.
+            ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
+        :raises click.ClickException: If the URL is an Apps URL but no
+            workspace host can be resolved to rewrite it to -- failing here
+            beats failing later inside the sandbox, where the only symptom is
+            an opaque registration timeout.
+        """
+        from urllib.parse import urlsplit
+
+        hostname = urlsplit(server_url).hostname or ""
+        if not hostname.endswith(_APPS_HOST_SUFFIX):
+            return server_url
+        workspace_host = self._workspace_host()
+        if not workspace_host:
+            raise click.ClickException(
+                f"Databricks Sandbox hosts cannot authenticate to the Databricks Apps "
+                f"URL {server_url!r} (its OAuth edge rejects the workspace PAT a sandbox "
+                f"holds), and no workspace host could be resolved to rewrite it to the "
+                f"{_WORKSPACE_API_PATH} mount. Set DATABRICKS_HOST, or configure "
+                f"'sandbox.server_url' as the workspace mount URL directly."
+            )
+        rewritten = f"{workspace_host}{_WORKSPACE_API_PATH}"
+        logger.info("dialing back through the workspace API mount %s", rewritten)
+        return rewritten
+
+    def _workspace_host(self) -> str | None:
+        """
+        Resolve this workspace's base URL, e.g.
+        ``"https://example.cloud.databricks.com"``.
+
+        Prefers the ambient ``DATABRICKS_HOST`` (always set inside a
+        Databricks App, and cheap) so the direct-SSH path never pulls in the
+        optional SDK extra; falls back to the SDK's own resolution, which the
+        job-delegated path has already loaded anyway.
+
+        :returns: The workspace base URL without a trailing slash, or ``None``
+            when neither source resolves one.
+        """
+        import os
+
+        host = (os.environ.get("DATABRICKS_HOST") or "").strip().rstrip("/")
+        if not host:
+            try:
+                host = str(getattr(self._sdk().config, "host", "") or "").strip().rstrip("/")
+            except Exception:  # pragma: no cover - optional SDK, best effort
+                return None
+        if not host:
+            return None
+        return host if "://" in host else f"https://{host}"
 
     # ── Job-delegated bootstrap ─────────────────────────
 

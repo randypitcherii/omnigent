@@ -2276,3 +2276,123 @@ def test_warm_compute_fails_fast_on_an_errored_cluster(
     # never leaves the armed host token sitting in a workspace secret.
     assert fake.secrets.put_calls == []
     assert fake.jobs.submit_calls == []
+
+
+# --- dial-back URL ---------------------------------------------------------
+
+
+def test_dial_back_rewrites_an_apps_url_to_the_workspace_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sandbox holds a workspace PAT, and the Databricks Apps OAuth edge
+    answers 302 to a PAT — so an in-sandbox host pointed at the app's own
+    hostname dies on its `/v1/me` pre-flight and the managed launch fails
+    with a registration timeout. The same server answered through the
+    workspace API mount accepts that PAT, so the Apps URL is rewritten.
+    """
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com/")
+    launcher = DatabricksSandboxLauncher()
+
+    assert (
+        launcher._dial_back_url("https://omnigent-dev-1.aws.databricksapps.com")
+        == "https://example.cloud.databricks.com/api/2.0/omnigent"
+    )
+
+
+def test_dial_back_leaves_a_non_apps_url_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Only the Apps edge has the PAT problem. A workspace mount URL, a
+    self-hosted server, or a local one must pass through verbatim — and
+    without resolving a workspace host at all, so the direct-SSH path never
+    needs the optional SDK extra.
+    """
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    launcher = DatabricksSandboxLauncher()
+
+    for url in (
+        "https://example.cloud.databricks.com/api/2.0/omnigent",
+        "https://omnigent.example.com",
+        "http://127.0.0.1:6767",
+    ):
+        assert launcher._dial_back_url(url) == url
+
+
+def test_dial_back_normalizes_a_schemeless_workspace_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`DATABRICKS_HOST` is commonly set without a scheme; the sandbox needs
+    a dialable URL, so one is supplied."""
+    monkeypatch.setenv("DATABRICKS_HOST", "example.cloud.databricks.com")
+    launcher = DatabricksSandboxLauncher()
+
+    assert (
+        launcher._dial_back_url("https://omnigent-dev-1.aws.databricksapps.com")
+        == "https://example.cloud.databricks.com/api/2.0/omnigent"
+    )
+
+
+@pytest.mark.databricks
+def test_dial_back_falls_back_to_the_sdk_workspace_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no ambient `DATABRICKS_HOST`, the SDK's own resolution answers —
+    the job-delegated path has loaded it anyway."""
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    _install_job_bootstrap(monkeypatch)
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    assert (
+        launcher._dial_back_url("https://omnigent-dev-1.aws.databricksapps.com")
+        == "https://fake.cloud.databricks.com/api/2.0/omnigent"
+    )
+
+
+def test_dial_back_fails_loud_when_no_workspace_host_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Handing the sandbox an Apps URL it cannot authenticate against fails
+    later as an opaque registration timeout. Fail here instead, where the
+    diagnosis is still in hand.
+    """
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    launcher = DatabricksSandboxLauncher()
+    monkeypatch.setattr(launcher, "_workspace_host", lambda: None)
+
+    with pytest.raises(click.ClickException, match="no workspace host could be resolved"):
+        launcher._dial_back_url("https://omnigent-dev-1.aws.databricksapps.com")
+
+
+@pytest.mark.databricks
+def test_start_host_dials_the_workspace_mount_not_the_apps_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    End to end: the operator configures the app's public URL, and the
+    `omnigent host` command that actually runs inside the sandbox targets
+    the workspace mount.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/home/sandbox-agent/workspace\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent-dev-1.aws.databricksapps.com",
+    )
+
+    payload = "\n".join(call[2] for call in fake.secrets.put_calls)
+    assert "https://example.cloud.databricks.com/api/2.0/omnigent" in payload
+    assert "databricksapps.com" not in payload
