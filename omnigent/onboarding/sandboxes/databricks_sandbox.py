@@ -201,6 +201,11 @@ _LAKEBOX_API_ROOT: str = "/api/2.0/lakebox"
 # Port the sandbox SSH gateway listens on (CLI: `defaultGatewayPort`).
 _SANDBOX_GATEWAY_PORT: str = "2222"
 
+# Name the bootstrap's SSH key is registered under, in the *job principal's*
+# key list. Purely a human label -- the gateway matches on key hash -- so a
+# stable one keeps a redeployment from accumulating near-duplicate entries.
+_KEY_REGISTRATION_NAME: str = "omnigent-job-bootstrap"
+
 # Gap between control-plane status polls while waiting for a sandbox to
 # reach Running. Matches the interval the bootstrap notebook uses.
 _REST_POLL_INTERVAL_S: float = 5.0
@@ -264,8 +269,8 @@ def api(method, path, body=None):
 
 
 # --- SSH identity -----------------------------------------------------
-# Private key only: unlike the CLI, nothing here pre-verifies registration
-# against `<key>.pub`, so no public half is needed on the cluster.
+# Only the private half is stored: the public half is derived here with
+# `ssh-keygen -y`, so the operator has one secret to rotate instead of two.
 key_material = dbutils.secrets.get(scope="{ssh_key_scope}", key="{ssh_key_key}")
 key_path = os.path.expanduser("~/.ssh/sandbox_ed25519")
 os.makedirs(os.path.dirname(key_path), exist_ok=True)
@@ -274,6 +279,31 @@ with open(key_path, "w") as fh:
     if not key_material.endswith("\\n"):
         fh.write("\\n")
 os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+
+# Sandboxes AND registered SSH keys are both per-identity, and this job runs
+# as the same principal that created the sandbox. A key registered under a
+# human's identity therefore does not open that principal's sandbox -- the
+# gateway answers `Permission denied (publickey)`. Registration is keyed by
+# key hash and re-POSTing an already-registered key returns the existing
+# record unchanged, so doing this on every run is idempotent and cheap; it
+# also means a fresh deployment needs no out-of-band registration step for
+# the principal.
+public_key = subprocess.run(
+    ["ssh-keygen", "-y", "-f", key_path],
+    capture_output=True,
+    text=True,
+    timeout=60,
+)
+if public_key.returncode != 0:
+    raise RuntimeError(
+        "could not derive the public half of the sandbox key: "
+        + public_key.stderr.strip()
+    )
+api(
+    "POST",
+    API_ROOT + "/ssh-keys",
+    {{"name": "{key_registration_name}", "publicKey": public_key.stdout.strip()}},
+)
 
 payload = json.loads(dbutils.secrets.get(scope="{argv_scope}", key="{argv_key}"))
 sandbox_id = payload["sandbox_id"]
@@ -904,6 +934,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 argv_scope=job_bootstrap.payload_scope,
                 argv_key=argv_secret_key,
                 api_root=_LAKEBOX_API_ROOT,
+                key_registration_name=_KEY_REGISTRATION_NAME,
                 gateway_port=_SANDBOX_GATEWAY_PORT,
                 workspace_host=client.config.host,
                 workspace_id=client.get_workspace_id(),

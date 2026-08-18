@@ -1153,6 +1153,51 @@ def test_job_bootstrap_deletes_the_payload_when_the_notebook_upload_fails(
 
 
 @pytest.mark.databricks
+def test_job_bootstrap_notebook_registers_the_principals_ssh_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The notebook must register its key under the *job principal's* identity.
+
+    Sandboxes and registered keys are both per-identity. The job runs as the
+    principal that created the sandbox, and a key registered under a human's
+    identity does not open that principal's sandbox — measured live, the
+    gateway answers `Permission denied (publickey)`. Registration is keyed by
+    key hash, so re-POSTing is a no-op and belongs on every run rather than
+    in an out-of-band setup step.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    (_path, content), *rest = fake.workspace.uploads
+    assert not rest
+    notebook = content.decode("utf-8")
+    # The public half is derived from the private key, so the operator has
+    # one secret to rotate rather than two.
+    assert 'ssh-keygen", "-y", "-f", key_path' in notebook
+    assert 'API_ROOT + "/ssh-keys"' in notebook
+    assert '"name": "omnigent-job-bootstrap"' in notebook
+    # Registration has to precede the SSH attempt it exists to authorize.
+    assert notebook.index("/ssh-keys") < notebook.index("subprocess.run(argv")
+
+
+@pytest.mark.databricks
 def test_job_bootstrap_notebook_uploads_as_python_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
