@@ -871,6 +871,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         """
         from databricks.sdk.service.compute import ClusterSpec
         from databricks.sdk.service.jobs import NotebookTask, RunResultState, SubmitTask
+        from databricks.sdk.service.workspace import ImportFormat, Language
 
         client = self._sdk()
         run_key = uuid.uuid4().hex
@@ -900,9 +901,17 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             workspace_host=client.config.host,
             workspace_id=client.get_workspace_id(),
         )
+        # `format` and `language` are both load-bearing, despite the SDK
+        # docstring implying SOURCE is the default: omit `format` and the
+        # workspace import API treats the body as a DBC archive and rejects
+        # it with "The zip archive contains no items", and the SDK only
+        # infers `language` from a path suffix — the per-run notebook path
+        # deliberately has none.
         client.workspace.upload(
             notebook_path,
             content=notebook_source.encode("utf-8"),
+            format=ImportFormat.SOURCE,
+            language=Language.PYTHON,
             overwrite=True,
         )
         run = None

@@ -782,10 +782,20 @@ class _FakeWorkspace:
     """Records ``workspace.upload`` / ``delete`` (the driver notebook)."""
 
     uploads: list[tuple[str, bytes]] = field(default_factory=list)
+    upload_kwargs: list[dict[str, object]] = field(default_factory=list)
     deletes: list[str] = field(default_factory=list)
 
-    def upload(self, path: str, *, content: bytes, overwrite: bool = True) -> None:
+    def upload(
+        self,
+        path: str,
+        *,
+        content: bytes,
+        format: object = None,
+        language: object = None,
+        overwrite: bool = True,
+    ) -> None:
         self.uploads.append((path, content))
+        self.upload_kwargs.append({"format": format, "language": language})
 
     def delete(self, path: str) -> None:
         self.deletes.append(path)
@@ -1103,6 +1113,46 @@ def test_start_host_via_job_stages_the_sandbox_id_with_the_script(
     payload = json.loads(fake.secrets.put_calls[0][2])
     assert payload["sandbox_id"] == "sb-42"
     assert "armed-token" in payload["remote_command"]
+
+
+@pytest.mark.databricks
+def test_job_bootstrap_notebook_uploads_as_python_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The driver notebook must be imported as PYTHON `SOURCE` explicitly.
+
+    Both arguments are load-bearing, measured against a live workspace:
+    omit `format` and the import API treats the body as a DBC archive and
+    rejects the upload with "The zip archive contains no items" (the SDK
+    docstring claims SOURCE is the default; the API disagrees), and the SDK
+    only infers `language` from a path suffix, which the per-run notebook
+    path deliberately does not have. Getting either wrong fails every
+    managed launch before the job is even submitted.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+    from databricks.sdk.service.workspace import ImportFormat, Language
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    launcher.start_host(
+        "sb-1",
+        token="armed-token",
+        host_id="host-1",
+        host_name="host-name",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert fake.workspace.upload_kwargs == [
+        {"format": ImportFormat.SOURCE, "language": Language.PYTHON}
+    ]
 
 
 @pytest.mark.databricks
