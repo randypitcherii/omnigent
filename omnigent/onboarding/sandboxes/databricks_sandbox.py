@@ -345,13 +345,41 @@ redact = [str(value) for value in payload.get("redact", []) if value]
 # automatically, and the values never enter the job run JSON. Exported ahead
 # of the script so the in-sandbox SDK mints an SP OAuth token the edge
 # accepts instead of falling back to that PAT.
+def read_host_auth_secret(scope, key):
+    """
+    Read one dial-back credential, naming the fix when the read is denied.
+
+    This notebook runs as the *coordinator's* identity -- the App's
+    platform-created service principal -- which is not the identity that
+    created the scope. A missing ACL therefore surfaces as a bare Py4J
+    ``PERMISSION_DENIED`` wrapped in the job's "Workload failed, see run
+    output for details", which is precisely the opaque failure this whole
+    path exists to remove. Name the scope, the key and the grant instead.
+    """
+    try:
+        return dbutils.secrets.get(scope=scope, key=key)
+    except Exception as error:
+        raise RuntimeError(
+            "cannot read the dial-back credential (secret scope "
+            + repr(scope)
+            + ", key "
+            + repr(key)
+            + "): "
+            + str(error)
+            + " -- this bootstrap job runs as the Omnigent App's service"
+            + " principal, so THAT principal (not the operator who created"
+            + " the scope) needs read access to it:"
+            + " databricks secrets put-acl "
+            + scope
+            + " <app-service-principal-application-id> READ"
+        ) from error
+
+
 host_auth = payload.get("host_auth")
 if host_auth:
-    client_id = dbutils.secrets.get(
-        scope=host_auth["scope"], key=host_auth["client_id_key"]
-    )
-    client_secret = dbutils.secrets.get(
-        scope=host_auth["scope"], key=host_auth["client_secret_key"]
+    client_id = read_host_auth_secret(host_auth["scope"], host_auth["client_id_key"])
+    client_secret = read_host_auth_secret(
+        host_auth["scope"], host_auth["client_secret_key"]
     )
     # The remote script's own stdout is NOT auto-redacted, and it lands in
     # durable job-run JSON -- so the secret joins the caller's scrub list.
@@ -1499,7 +1527,17 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 tasks=[task],
                 timeout_seconds=int(job_bootstrap.timeout_s),
             )
-            run = waiter.result()
+            try:
+                run = waiter.result()
+            except Exception as wait_error:
+                # A run that ends INTERNAL_ERROR (a notebook exception, most
+                # often) makes the SDK waiter raise "failed to reach
+                # TERMINATED or SKIPPED" -- which reports the run's LIFECYCLE
+                # and nothing about the cause, while the actual traceback sits
+                # in the run output fetched below. Fall through to the shared
+                # failure path so the caller sees that instead.
+                logger.debug("job-bootstrap wait failed: %s", wait_error)
+                run = client.jobs.get_run(run_id=waiter.run_id)
         finally:
             # Both artifacts are per-run and carry (or point at) the armed
             # host token, so neither may outlive the run. Cleanup is

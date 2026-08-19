@@ -804,11 +804,21 @@ class _FakeWorkspace:
 
 @dataclass
 class _FakeWait:
-    """Stands in for the ``Wait`` object ``jobs.submit`` returns."""
+    """
+    Stands in for the ``Wait`` object ``jobs.submit`` returns.
+
+    :param wait_error: Raised from :meth:`result` instead of returning,
+        standing in for the SDK waiter giving up on a run that never
+        reached a terminal-and-successful lifecycle state.
+    """
 
     run: SimpleNamespace
+    wait_error: Exception | None = None
+    run_id: int = 111
 
     def result(self) -> SimpleNamespace:
+        if self.wait_error is not None:
+            raise self.wait_error
         return self.run
 
 
@@ -828,17 +838,25 @@ class _FakeJobs:
     notebook_output: str | None = None
     logs: str | None = None
     error: str | None = None
+    wait_error: Exception | None = None
     submit_calls: list[dict[str, Any]] = field(default_factory=list)
     run_output_calls: list[int] = field(default_factory=list)
+    get_run_calls: list[int] = field(default_factory=list)
 
-    def submit(self, **kwargs: Any) -> _FakeWait:
-        self.submit_calls.append(kwargs)
-        run = SimpleNamespace(
+    def _run(self) -> SimpleNamespace:
+        return SimpleNamespace(
             state=SimpleNamespace(result_state=self.result_state, life_cycle_state="TERMINATED"),
             tasks=[SimpleNamespace(run_id=999)],
             run_id=111,
         )
-        return _FakeWait(run=run)
+
+    def submit(self, **kwargs: Any) -> _FakeWait:
+        self.submit_calls.append(kwargs)
+        return _FakeWait(run=self._run(), wait_error=self.wait_error)
+
+    def get_run(self, run_id: int) -> SimpleNamespace:
+        self.get_run_calls.append(run_id)
+        return self._run()
 
     def get_run_output(self, run_id: int) -> SimpleNamespace:
         self.run_output_calls.append(run_id)
@@ -1625,6 +1643,37 @@ def test_delegated_run_reports_a_failed_job_as_a_nonzero_result_when_unchecked(
 
     with pytest.raises(click.ClickException):
         launcher.run("sb-1", "tail -n 50 /tmp/omnigent-host.log")
+
+
+@pytest.mark.databricks
+def test_a_failed_waiter_still_reports_the_runs_own_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A run that dies INTERNAL_ERROR makes the SDK waiter raise, and its
+    message names only the lifecycle state ("failed to reach TERMINATED or
+    SKIPPED") — the cause is in the run output. Swallowing the waiter and
+    falling through to the run-output failure path is the whole difference
+    between an opaque launch failure and a legible one.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.FAILED,
+            error="PERMISSION_DENIED: no secrets/get on scope omnigent-sandbox-host-auth",
+            wait_error=TimeoutError("failed to reach TERMINATED or SKIPPED"),
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(job_bootstrap=_job_bootstrap_config())
+
+    with pytest.raises(click.ClickException) as failure:
+        launcher.run("sb-1", "tail -n 50 /tmp/omnigent-host.log")
+
+    assert "PERMISSION_DENIED" in str(failure.value)
+    assert "omnigent-sandbox-host-auth" in str(failure.value)
+    assert fake.jobs.get_run_calls == [111]
 
 
 def test_start_host_without_job_bootstrap_ssh_directly_as_before(
@@ -2505,8 +2554,11 @@ def test_notebook_exports_the_dial_back_credential_and_scrubs_the_secret(
     # surface on a real job run, minutes into a launch.
     compile(notebook, "<notebook>", "exec")
     for fragment in (
-        "client_secret = dbutils.secrets.get(",
+        "client_secret = read_host_auth_secret(",
         "redact.append(client_secret)",
+        # A missing scope ACL is the likeliest failure here, and the raw Py4J
+        # denial says nothing actionable -- the notebook names the grant.
+        "databricks secrets put-acl ",
         '"DATABRICKS_HOST=" + shlex.quote(host_auth["workspace_host"])',
         '"export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET"',
         '"unset DATABRICKS_CONFIG_PROFILE"',
