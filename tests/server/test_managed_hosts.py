@@ -1773,6 +1773,103 @@ def test_parse_databricks_job_bootstrap_fails_loud(
     assert expected_fragment in str(exc.value)
 
 
+def test_parse_databricks_host_auth_reaches_the_launcher() -> None:
+    """
+    ``sandbox.databricks.host_auth`` is the only way an operator can give the
+    in-sandbox host a credential the Databricks Apps edge accepts, so it has
+    to survive YAML parsing intact — without it an Apps ``server_url`` is
+    rejected outright.
+    """
+    from omnigent.onboarding.sandboxes.databricks_sandbox import DatabricksSandboxLauncher
+
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://omnigent-dev-1.aws.databricksapps.com",
+            "databricks": {
+                "host_auth": {
+                    "secret_scope": "omnigent-sandbox-host-auth",
+                    "client_id_key": "sp-client-id",
+                    "client_secret_key": "sp-client-secret",
+                    "workspace_host": "https://example.cloud.databricks.com",
+                },
+            },
+        }
+    )
+
+    assert cfg is not None
+    launcher = cfg.default.launcher_factory()
+    assert isinstance(launcher, DatabricksSandboxLauncher)
+    host_auth = launcher._host_auth
+    assert host_auth is not None
+    assert host_auth.secret_scope == "omnigent-sandbox-host-auth"
+    assert host_auth.client_id_key == "sp-client-id"
+    assert host_auth.client_secret_key == "sp-client-secret"
+    assert host_auth.workspace_host == "https://example.cloud.databricks.com"
+
+
+def test_parse_databricks_host_auth_defaults_the_optional_fields() -> None:
+    """
+    Naming the scope is enough: the key names default to the conventional
+    pair, and an omitted ``workspace_host`` means "the coordinator's own
+    workspace", resolved at launch rather than pinned here.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "databricks",
+            "server_url": "https://s.example.com",
+            "databricks": {"host_auth": {"secret_scope": "omnigent-sandbox-host-auth"}},
+        }
+    )
+
+    assert cfg is not None
+    host_auth = cfg.default.launcher_factory()._host_auth  # type: ignore[attr-defined]
+    assert host_auth.client_id_key == "client-id"
+    assert host_auth.client_secret_key == "client-secret"
+    assert host_auth.workspace_host is None
+
+
+def test_parse_databricks_without_host_auth_leaves_the_ambient_credential() -> None:
+    """Omitting the block keeps the host on the sandbox's mounted PAT, which
+    is fine for any server URL that credential can actually reach."""
+    cfg = parse_sandbox_config({"provider": "databricks", "server_url": "https://s.example.com"})
+
+    assert cfg is not None
+    assert cfg.default.launcher_factory()._host_auth is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("block", "expected_fragment"),
+    [
+        # Without a scope there is nothing to read the credential from, and
+        # the failure would otherwise land minutes into a launch, on the job
+        # cluster, as a bare secrets-lookup error.
+        ({"client_id_key": "id"}, "host_auth.secret_scope"),
+        ({"secret_scope": "   "}, "host_auth.secret_scope"),
+        # A typo in a key name would look up a secret that does not exist, so
+        # unknown keys are rejected outright.
+        (
+            {"secret_scope": "s", "client_secret_ky": "k"},
+            "unknown key(s): client_secret_ky",
+        ),
+        ({"secret_scope": "s", "client_id_key": ""}, "host_auth.client_id_key"),
+    ],
+)
+def test_parse_databricks_host_auth_fails_loud(
+    block: dict[str, object], expected_fragment: str
+) -> None:
+    """A malformed block must stop server startup, not the first launch."""
+    with pytest.raises(ValueError) as exc:
+        parse_sandbox_config(
+            {
+                "provider": "databricks",
+                "server_url": "https://s.example.com",
+                "databricks": {"host_auth": block},
+            }
+        )
+    assert expected_fragment in str(exc.value)
+
+
 # ── parse_repo_workspace ────────────────────────────────────
 
 

@@ -19,6 +19,7 @@ from omnigent.onboarding.sandboxes.databricks_sandbox import (
     AUTH_HINT,
     INSTALL_HINT,
     DatabricksSandboxLauncher,
+    HostAuthConfig,
     JobBootstrapConfig,
 )
 
@@ -2380,3 +2381,134 @@ def test_start_host_dials_the_configured_override(
     payload = "\n".join(call[2] for call in fake.secrets.put_calls)
     assert "https://omnigent.internal" in payload
     assert "databricksapps.com" not in payload
+
+
+# --- dial-back credential (`host_auth`) ------------------------------------
+
+
+def test_host_auth_config_rejects_a_blank_field() -> None:
+    """
+    A blank scope or key name would otherwise fail minutes later, on the job
+    cluster, as a bare secrets-lookup error with nothing pointing back at
+    config. Reject it at construction, where the operator is still holding
+    their YAML.
+    """
+    for field_name in ("secret_scope", "client_id_key", "client_secret_key"):
+        fields = {"secret_scope": "omnigent-sandbox-host-auth", field_name: "   "}
+        with pytest.raises(ValueError, match=field_name):
+            HostAuthConfig(**fields)  # type: ignore[arg-type]
+
+
+def test_dial_back_allows_an_apps_url_when_host_auth_is_configured() -> None:
+    """
+    `host_auth` is the credential the Apps edge accepts where the sandbox's
+    ambient PAT gets a 302 — so with it configured the app's own hostname is
+    a usable dial-back target and passes through verbatim, no proxy needed.
+    """
+    launcher = DatabricksSandboxLauncher(
+        host_auth=HostAuthConfig(secret_scope="omnigent-sandbox-host-auth")
+    )
+    url = "https://omnigent-dev-1.aws.databricksapps.com"
+
+    assert launcher._resolve_dial_back_url(url) == url
+
+
+@pytest.mark.databricks
+def test_host_bootstrap_payload_carries_only_host_auth_key_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The client secret must never pass through the coordinator: the payload
+    names the scope and keys, and the job cluster does the `dbutils.secrets.get`.
+    `workspace_host` defaults to the coordinator's own workspace, which is
+    where the sandbox lives.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(),
+        host_auth=HostAuthConfig(secret_scope="omnigent-sandbox-host-auth"),
+    )
+
+    _launch(launcher, "sb-1", "armed-token")
+
+    payload = json.loads(fake.secrets.put_calls[0][2])
+    assert payload["host_auth"] == {
+        "scope": "omnigent-sandbox-host-auth",
+        "client_id_key": "client-id",
+        "client_secret_key": "client-secret",
+        "workspace_host": _FakeConfig().host,
+    }
+
+
+@pytest.mark.databricks
+def test_only_the_host_bootstrap_gets_the_dial_back_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Every other remote command this launcher runs has no dial-back to
+    authenticate, and the exported credential is inherited by everything the
+    notebook spawns — so handing one to, say, a log-tailing `run` would widen
+    the principal's reach for nothing.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(result_state=RunResultState.SUCCESS, notebook_output="ok\n"),
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(),
+        host_auth=HostAuthConfig(secret_scope="omnigent-sandbox-host-auth"),
+    )
+
+    launcher.run("sb-1", "tail -n 50 /tmp/omnigent-host.log")
+
+    assert "host_auth" not in json.loads(fake.secrets.put_calls[0][2])
+
+
+@pytest.mark.databricks
+def test_notebook_exports_the_dial_back_credential_and_scrubs_the_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The notebook is the only place the secret exists, and it must both reach
+    the SDK (as OAuth client credentials, with any config-file profile unset
+    so the SDK cannot fall back to the mounted PAT) and stay out of the
+    durable job-run JSON the remote command's own stdout lands in.
+    """
+    from databricks.sdk.service.jobs import RunResultState
+
+    fake = _install_job_bootstrap(
+        monkeypatch,
+        jobs=_FakeJobs(
+            result_state=RunResultState.SUCCESS,
+            notebook_output=f"{dbx._WORKSPACE_TAG}/ws\n",
+        ),
+    )
+    launcher = DatabricksSandboxLauncher(
+        job_bootstrap=_job_bootstrap_config(),
+        host_auth=HostAuthConfig(secret_scope="omnigent-sandbox-host-auth"),
+    )
+
+    _launch(launcher, "sb-1", "armed-token")
+
+    notebook = fake.workspace.uploads[0][1].decode()
+    # Valid Python: a syntax error in this template would otherwise only
+    # surface on a real job run, minutes into a launch.
+    compile(notebook, "<notebook>", "exec")
+    for fragment in (
+        "client_secret = dbutils.secrets.get(",
+        "redact.append(client_secret)",
+        '"DATABRICKS_HOST=" + shlex.quote(host_auth["workspace_host"])',
+        '"export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET"',
+        '"unset DATABRICKS_CONFIG_PROFILE"',
+    ):
+        assert fragment in notebook

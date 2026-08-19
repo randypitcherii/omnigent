@@ -166,7 +166,10 @@ from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
-    from omnigent.onboarding.sandboxes.databricks_sandbox import JobBootstrapConfig
+    from omnigent.onboarding.sandboxes.databricks_sandbox import (
+        HostAuthConfig,
+        JobBootstrapConfig,
+    )
     from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
@@ -1152,6 +1155,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "bootstrap_command",
                     "job_bootstrap",
                     "dial_back_url",
+                    "host_auth",
                 },
                 "sandbox.databricks",
             )
@@ -1164,6 +1168,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             bootstrap_command=_parse_provider_string(raw, "databricks", "bootstrap_command"),
             job_bootstrap=_parse_databricks_job_bootstrap(databricks_section),
             dial_back_url=_parse_provider_string(raw, "databricks", "dial_back_url"),
+            host_auth=_parse_databricks_host_auth(databricks_section),
         )
         token_ttl_s = DATABRICKS_MANAGED_TOKEN_TTL_S
     elif provider == "islo":
@@ -2031,6 +2036,77 @@ def _parse_databricks_job_bootstrap(
         raise ValueError(f"server config 'sandbox.databricks.job_bootstrap': {error}") from error
 
 
+def _parse_databricks_host_auth(
+    section: dict[str, object] | None,
+) -> HostAuthConfig | None:
+    """
+    Build the dial-back credential config from ``sandbox.databricks.host_auth``.
+
+    Present only when the in-sandbox host needs a credential of its own to
+    reach ``sandbox.server_url`` — which is exactly the Databricks Apps case,
+    where the ambient workspace PAT a sandbox holds is refused by the Apps
+    OAuth edge. See
+    :class:`~omnigent.onboarding.sandboxes.databricks_sandbox.HostAuthConfig`
+    for what the named service principal should (and should not) be able to do.
+
+    *secret_scope* is required because there is no guessable default for where
+    an operator keeps their client credentials. The two key names default to
+    ``client-id`` / ``client-secret``, and *workspace_host* defaults to the
+    coordinator's own workspace — the right answer whenever app and sandbox
+    share a workspace, which they always do here.
+
+    :param section: The ``sandbox.databricks`` mapping, or ``None`` when the
+        provider block is omitted entirely.
+    :returns: The parsed config, or ``None`` when ``host_auth`` is absent (the
+        host then dials with its ambient PAT, which works for any server URL
+        that credential can reach).
+    :raises ValueError: When the block is malformed or a named field is not a
+        non-empty string.
+    """
+    if section is None:
+        return None
+    block = section.get("host_auth")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise ValueError("server config 'sandbox.databricks.host_auth' must be a mapping")
+    _reject_unknown_keys(
+        block,
+        {"secret_scope", "client_id_key", "client_secret_key", "workspace_host"},
+        "sandbox.databricks.host_auth",
+    )
+
+    def _field(key: str, *, required: bool) -> str | None:
+        """Read a string field out of the block, blank rejected either way."""
+        value = block.get(key)
+        if value is None:
+            if required:
+                raise ValueError(f"server config 'sandbox.databricks.host_auth.{key}' is required")
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"server config 'sandbox.databricks.host_auth.{key}' must be a non-empty string"
+            )
+        return value.strip()
+
+    from omnigent.onboarding.sandboxes.databricks_sandbox import HostAuthConfig
+
+    overrides: dict[str, str] = {}
+    for key in ("client_id_key", "client_secret_key", "workspace_host"):
+        value = _field(key, required=False)
+        if value is not None:
+            overrides[key] = value
+    # `HostAuthConfig.__post_init__` rejects blank fields; re-raised as the
+    # config error it is, so an operator reads it as a problem with their YAML.
+    try:
+        return HostAuthConfig(
+            secret_scope=_field("secret_scope", required=True) or "",
+            **overrides,
+        )
+    except ValueError as error:
+        raise ValueError(f"server config 'sandbox.databricks.host_auth': {error}") from error
+
+
 def _databricks_launcher_factory(
     *,
     cli_path: str | None,
@@ -2040,6 +2116,7 @@ def _databricks_launcher_factory(
     bootstrap_command: str | None = None,
     job_bootstrap: JobBootstrapConfig | None = None,
     dial_back_url: str | None = None,
+    host_auth: HostAuthConfig | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: databricks`` path.
@@ -2066,6 +2143,10 @@ def _databricks_launcher_factory(
         it. ``None`` dials ``sandbox.server_url`` unchanged -- which the
         launcher rejects for a Databricks Apps URL, since a sandbox holds only
         a workspace PAT and the Apps OAuth edge refuses it.
+    :param host_auth: Service-principal OAuth credentials the in-sandbox
+        host authenticates its dial-back with, which is what makes a
+        Databricks Apps ``server_url`` usable without a proxy. ``None``
+        leaves the host on its ambient workspace PAT.
     :returns: A factory producing parameterized Databricks launchers.
     """
 
@@ -2081,6 +2162,7 @@ def _databricks_launcher_factory(
             bootstrap_command=bootstrap_command,
             job_bootstrap=job_bootstrap,
             dial_back_url=dial_back_url,
+            host_auth=host_auth,
         )
 
     return _build

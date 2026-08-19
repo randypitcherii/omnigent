@@ -248,6 +248,7 @@ _REST_POLL_INTERVAL_S: float = 5.0
 _JOB_BOOTSTRAP_NOTEBOOK_TEMPLATE: str = '''# Databricks notebook source
 import json
 import os
+import shlex
 import stat
 import subprocess
 import time
@@ -334,6 +335,40 @@ remote_command = payload["remote_command"]
 # not, and both `dbutils.notebook.exit` and an exception message land in
 # durable job-run JSON that anyone with job-read access can read.
 redact = [str(value) for value in payload.get("redact", []) if value]
+
+# --- Dial-back credential (optional) ----------------------------------
+# A sandbox's ambient credential is its owner's workspace PAT, and the
+# Databricks Apps OAuth edge answers HTTP 302 to a PAT -- so a host dialling
+# an Apps URL cannot authenticate at all. When the launcher names a service
+# principal, its OAuth client credentials are fetched HERE rather than in the
+# coordinator: `dbutils.secrets.get` is redacted from notebook output
+# automatically, and the values never enter the job run JSON. Exported ahead
+# of the script so the in-sandbox SDK mints an SP OAuth token the edge
+# accepts instead of falling back to that PAT.
+host_auth = payload.get("host_auth")
+if host_auth:
+    client_id = dbutils.secrets.get(
+        scope=host_auth["scope"], key=host_auth["client_id_key"]
+    )
+    client_secret = dbutils.secrets.get(
+        scope=host_auth["scope"], key=host_auth["client_secret_key"]
+    )
+    # The remote script's own stdout is NOT auto-redacted, and it lands in
+    # durable job-run JSON -- so the secret joins the caller's scrub list.
+    redact.append(client_secret)
+    remote_command = "\\n".join(
+        [
+            "DATABRICKS_HOST=" + shlex.quote(host_auth["workspace_host"]),
+            "DATABRICKS_CLIENT_ID=" + shlex.quote(client_id),
+            "DATABRICKS_CLIENT_SECRET=" + shlex.quote(client_secret),
+            "export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET",
+            # A profile name left in the env sends the SDK back to the config
+            # file (and the PAT in it): `Config._known_file_config_loader`
+            # skips that file only when NO profile is named.
+            "unset DATABRICKS_CONFIG_PROFILE",
+            remote_command,
+        ]
+    )
 
 
 def scrub(text):
@@ -563,6 +598,79 @@ class JobBootstrapConfig:
         return self.payload_secret_scope or self.ssh_key_secret_scope
 
 
+@dataclass(frozen=True)
+class HostAuthConfig:
+    """
+    Service-principal OAuth credentials the in-sandbox host dials back with.
+
+    Exists because a Databricks Sandbox cannot authenticate to a Databricks
+    Apps URL on its own. The only credential the platform mounts in a sandbox
+    is its owner's workspace PAT (``/run/lakebox/databrickscfg``), and the
+    Apps OAuth edge answers HTTP 302 to a PAT under every header spelling --
+    so ``omnigent host`` pointed at a ``*.databricksapps.com`` server dies on
+    its ``/v1/me`` pre-flight and the launch fails as an opaque registration
+    timeout. A sandbox also cannot mint an OAuth token (the in-sandbox
+    ``databricks auth login`` needs a browser) nor exchange the PAT for one
+    (workspace token exchange requires a federation policy it has none of).
+
+    Naming a scope here closes that gap: the bootstrap notebook reads the
+    named client id/secret and exports them as ``DATABRICKS_CLIENT_ID`` /
+    ``DATABRICKS_CLIENT_SECRET`` / ``DATABRICKS_HOST`` ahead of the host
+    launch, so the in-sandbox SDK mints an OAuth token for that principal
+    instead of falling back to the PAT. The credential is read on the job
+    cluster via ``dbutils.secrets.get`` -- never in the coordinator, and
+    never through job-run JSON.
+
+    **The service principal must hold nothing beyond ``CAN_USE`` on the
+    app.** Environment variables are inherited, so the host process, the
+    runner it spawns, and every agent command below them all authenticate as
+    this principal. That is acceptable exactly to the degree the principal is
+    powerless elsewhere: a dedicated SP whose only grant is ``CAN_USE`` on
+    the Omnigent app (plus, necessarily, whatever the agent's own work
+    legitimately needs) turns a sandbox compromise into app access, where
+    reusing a broadly-privileged identity -- the coordinator app's own SP,
+    say -- would hand over that identity's full workspace reach.
+    """
+
+    secret_scope: str
+    """Databricks Secrets scope holding the service principal's OAuth client
+    credentials, e.g. ``"omnigent-sandbox-host-auth"``.
+
+    Worth keeping separate from the job-bootstrap scopes: this one holds a
+    long-lived credential and the coordinator needs no access to it at all
+    (the job cluster reads it), where the payload scope needs coordinator
+    ``WRITE``."""
+
+    client_id_key: str = "client-id"
+    """Key within :attr:`secret_scope` holding the OAuth client id -- the
+    service principal's ``applicationId``."""
+
+    client_secret_key: str = "client-secret"
+    """Key within :attr:`secret_scope` holding the OAuth client secret, as
+    minted by ``databricks service-principal-secrets-proxy create``."""
+
+    workspace_host: str | None = None
+    """Workspace the client credentials authenticate against, e.g.
+    ``"https://example.cloud.databricks.com"``.
+
+    ``None`` (the default) uses the coordinator's own resolved workspace
+    host, which is the right answer whenever the app and the sandbox live in
+    the same workspace -- i.e. always, since a sandbox is provisioned by this
+    coordinator."""
+
+    def __post_init__(self) -> None:
+        """
+        Reject an unusable configuration.
+
+        :raises ValueError: When any named field is blank -- a blank scope or
+            key would fail deep inside the bootstrap notebook, minutes later,
+            as a secrets lookup error with no hint that config is the cause.
+        """
+        for field_name in ("secret_scope", "client_id_key", "client_secret_key"):
+            if not getattr(self, field_name).strip():
+                raise ValueError(f"HostAuthConfig.{field_name} must be a non-empty string")
+
+
 def _drain_forward_output(
     process: subprocess.Popen[str],
     transcript: list[str],
@@ -771,6 +879,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         bootstrap_command: str | None = None,
         job_bootstrap: JobBootstrapConfig | None = None,
         dial_back_url: str | None = None,
+        host_auth: HostAuthConfig | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -808,8 +917,15 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             that fronts the same server on an address a sandbox can
             authenticate to. ``None`` (the default) means the host dials
             ``sandbox.server_url`` as configured -- which a Databricks Apps
-            URL cannot be, so that combination is rejected up front rather
+            URL cannot be *unless* *host_auth* supplies a credential the
+            Apps edge accepts, so that combination is rejected up front rather
             than left to time out. See :meth:`_resolve_dial_back_url`.
+        :param host_auth: Service-principal OAuth credentials the in-sandbox
+            host authenticates its dial-back with -- see
+            :class:`HostAuthConfig`. Setting it is what makes a Databricks
+            Apps ``server_url`` usable, since the sandbox's ambient PAT is
+            not. ``None`` (the default) leaves the host on that ambient
+            credential, which works for a server the PAT can reach.
         """
         self._cli_path = cli_path or DEFAULT_CLI_BINARY
         self._profile = profile
@@ -818,6 +934,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         self._bootstrap_command = bootstrap_command
         self._job_bootstrap = job_bootstrap
         self._dial_back_url = (dial_back_url or "").strip().rstrip("/") or None
+        self._host_auth = host_auth
         # Memoized lazily by `_sdk()`; the SDK is an optional extra, so it is
         # never imported on the direct-SSH path.
         self._client: object | None = None
@@ -870,12 +987,17 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         the launch fails as an opaque registration timeout two minutes
         later.
 
-        So an Apps ``server_url`` is rejected HERE, before a sandbox is
-        provisioned and a bootstrap job submitted, naming the reason. An
-        operator who has arranged a reachable address for the same server --
-        a reverse proxy, a tunnel, or an in-sandbox credential this launcher
-        cannot see -- points ``sandbox.databricks.dial_back_url`` at it and
-        that URL is used verbatim.
+        Two things lift that, and an Apps URL passes when either is
+        configured. ``sandbox.databricks.host_auth`` gives the sandbox a
+        service-principal OAuth credential the edge does accept (see
+        :class:`HostAuthConfig`) -- measured: HTTP 200 on ``/v1/me`` where the
+        PAT gets 302. ``sandbox.databricks.dial_back_url`` instead names a
+        different address for the same server -- a reverse proxy or tunnel --
+        and is used verbatim.
+
+        With neither, an Apps ``server_url`` is rejected HERE, before a
+        sandbox is provisioned and a bootstrap job submitted, naming the
+        reason.
 
         Note this deliberately does NOT rewrite an Apps URL to the
         ``/api/2.0/omnigent`` workspace mount: that path is Databricks'
@@ -889,7 +1011,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             ``"https://omnigent-dev-123.aws.databricksapps.com"``.
         :returns: The URL the in-sandbox host should dial.
         :raises click.ClickException: When *server_url* is a Databricks Apps
-            URL and no ``dial_back_url`` override is configured.
+            URL and neither ``host_auth`` nor ``dial_back_url`` is configured.
         """
         from urllib.parse import urlsplit
 
@@ -899,12 +1021,21 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         hostname = urlsplit(server_url).hostname or ""
         if not hostname.endswith(_APPS_HOST_SUFFIX):
             return server_url
+        if self._host_auth is not None:
+            logger.info(
+                "dialing back to the Apps URL %s with service-principal credentials "
+                "from secret scope %s",
+                server_url,
+                self._host_auth.secret_scope,
+            )
+            return server_url
         raise click.ClickException(
             f"A Databricks Sandbox host cannot authenticate to the Databricks Apps URL "
             f"{server_url!r}: the Apps OAuth edge rejects the workspace PAT a sandbox "
             f"holds, and a sandbox can neither mint nor exchange for an OAuth token. "
-            f"Front this server on an address the sandbox can reach and set "
-            f"'sandbox.databricks.dial_back_url' to it."
+            f"Give the sandbox a credential the edge accepts by setting "
+            f"'sandbox.databricks.host_auth', or front this server on an address the "
+            f"sandbox can reach and set 'sandbox.databricks.dial_back_url' to it."
         )
 
     # ── Job-delegated bootstrap ─────────────────────────
@@ -1010,7 +1141,9 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             repo_name=repo_name,
             host_config=host_config,
         )
-        output = self._run_via_job(job_bootstrap, sandbox_id, script, redact=(token,))
+        output = self._run_via_job(
+            job_bootstrap, sandbox_id, script, redact=(token,), inject_host_auth=True
+        )
         for line in output.splitlines():
             if line.startswith(_WORKSPACE_TAG):
                 return line[len(_WORKSPACE_TAG) :].strip()
@@ -1206,6 +1339,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         remote_command: str,
         *,
         redact: Sequence[str] = (),
+        inject_host_auth: bool = False,
     ) -> str:
         """
         Submit and await the one-shot job that SSHes into *sandbox_id* on classic compute.
@@ -1251,6 +1385,12 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         :param redact: Strings (the armed host token) scrubbed from anything
             the notebook returns, because notebook output is durable job-run
             JSON readable by anyone with job-read access.
+        :param inject_host_auth: Have the notebook export the configured
+            :class:`HostAuthConfig` credentials ahead of *remote_command*.
+            Only the host bootstrap asks for this: the credential is what
+            lets the host authenticate its dial-back, and every other remote
+            command this launcher runs has no dial-back to authenticate, so
+            handing it one would widen the credential's reach for nothing.
         :returns: The job task's captured stdout, with *redact* scrubbed.
         :raises click.ClickException: On job failure, timeout, or missing output.
         """
@@ -1276,6 +1416,23 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                     "sandbox_id": sandbox_id,
                     "remote_command": remote_command,
                     "redact": list(redact),
+                    # Scope and key NAMES only -- the values are read on the
+                    # job cluster, so no credential passes through the
+                    # coordinator or this payload.
+                    **(
+                        {
+                            "host_auth": {
+                                "scope": self._host_auth.secret_scope,
+                                "client_id_key": self._host_auth.client_id_key,
+                                "client_secret_key": self._host_auth.client_secret_key,
+                                "workspace_host": (
+                                    self._host_auth.workspace_host or client.config.host
+                                ),
+                            }
+                        }
+                        if inject_host_auth and self._host_auth is not None
+                        else {}
+                    ),
                 }
             ),
         )
