@@ -2562,5 +2562,9 @@ def test_notebook_exports_the_dial_back_credential_and_scrubs_the_secret(
         '"DATABRICKS_HOST=" + shlex.quote(host_auth["workspace_host"])',
         '"export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET"',
         '"unset DATABRICKS_CONFIG_PROFILE"',
+        # The runner is a separate process behind an env allowlist that drops
+        # bearer secrets: without widening it the runner falls back to the
+        # sandbox's PAT and the Apps edge rejects its tunnel upgrade.
+        '"export OMNIGENT_RUNNER_ENV_PASSTHROUGH"',
     ):
         assert fragment in notebook

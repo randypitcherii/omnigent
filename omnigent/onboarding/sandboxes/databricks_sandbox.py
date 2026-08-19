@@ -390,6 +390,18 @@ if host_auth:
             "DATABRICKS_CLIENT_ID=" + shlex.quote(client_id),
             "DATABRICKS_CLIENT_SECRET=" + shlex.quote(client_secret),
             "export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET",
+            # The host filters its own env down to an allowlist before
+            # spawning a runner, and bearer secrets are deliberately NOT on
+            # it -- so without this the runner re-resolves auth from
+            # ~/.databrickscfg (the sandbox owner's PAT), and the Apps edge
+            # answers its tunnel upgrade with a login-page redirect:
+            # "runner tunnel rejected by server". The passthrough env var is
+            # the supported way to widen that allowlist; any value already
+            # baked into the image is preserved.
+            'OMNIGENT_RUNNER_ENV_PASSTHROUGH="${{OMNIGENT_RUNNER_ENV_PASSTHROUGH:+'
+            + '$OMNIGENT_RUNNER_ENV_PASSTHROUGH,}}DATABRICKS_HOST,'
+            + 'DATABRICKS_CLIENT_ID,DATABRICKS_CLIENT_SECRET"',
+            "export OMNIGENT_RUNNER_ENV_PASSTHROUGH",
             # A profile name left in the env sends the SDK back to the config
             # file (and the PAT in it): `Config._known_file_config_loader`
             # skips that file only when NO profile is named.
