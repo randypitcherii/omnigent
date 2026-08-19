@@ -365,6 +365,51 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
     assert len(mint_calls) >= 1
 
 
+def test_non_owner_host_identity_mints_owner_token_before_using_host_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host whose identity is not the session owner never uses its bearer as one.
+
+    A managed sandbox host authenticating with a service principal hands the
+    runner a bearer the Apps edge accepts but the coordinator resolves to the
+    WRONG principal — every owner-scoped route then answers 404, which is
+    neither a 401 nor an OAuth redirect, so the bearer is never invalidated and
+    the owner-scoped mint below is masked forever (observed as
+    ``harness_spawn_failed`` with the session's agent spec "not found"). With
+    the host's marker set, the very first token must be the minted owner JWT,
+    and the host bearer must be used only as the mint's proxy bearer.
+    """
+    mint_calls: list[str | None] = []
+
+    def _no_sdk_auth(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        from omnigent.inner.databricks_executor import DatabricksAuthError
+
+        raise DatabricksAuthError("no credential configured")
+
+    def _mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        mint_calls.append(kwargs.get("proxy_bearer"))
+        return "managed-minted-token", time.time() + 3600
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-sp-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setenv("OMNIGENT_HOST_IDENTITY_NOT_SESSION_OWNER", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    # No wrong-identity bearer is ever handed out, not even once.
+    assert factory() == "managed-minted-token"
+    # ...but it is still what gets the mint request past the Apps OAuth edge.
+    assert mint_calls == ["host-sp-token"]
+
+
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

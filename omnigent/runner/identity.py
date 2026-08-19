@@ -25,6 +25,16 @@ RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
 # Host-launched runners use their binding token to obtain a short-lived,
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
+# Set by a host whose own identity is NOT the session owner's -- a managed
+# sandbox host authenticating with a service principal, say. Such a host's
+# bearer is useless as a runner *identity*: the Apps edge accepts it, the
+# coordinator resolves it to the wrong principal, and every owner-scoped route
+# answers 404 -- which is neither a 401 nor an OAuth redirect, so the bearer is
+# never invalidated and the owner-scoped delegated mint is masked forever. When
+# this marker is set the runner demotes the host bearer to a proxy bearer
+# (getting the mint request past the Apps edge) and takes its identity from the
+# minted, owner-scoped JWT instead.
+HOST_IDENTITY_NOT_OWNER_ENV_VAR = "OMNIGENT_HOST_IDENTITY_NOT_SESSION_OWNER"
 # Replica-routing key the runner stamps on its tunnel handshake so it
 # co-locates with the host that launched it (value = that host's host_id). The
 # host injects it when spawning the runner; absent for CLI-local runners, which

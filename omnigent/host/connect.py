@@ -414,6 +414,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Marker (not a secret) telling the runner that this host's identity is
+        # not the session owner's -- set by a bootstrap that authenticates the
+        # host with a service principal, as the Databricks sandbox provider
+        # does. The runner needs it to know that the host bearer it is handed is
+        # good for getting past an Apps OAuth edge but not for identifying
+        # itself to the coordinator. See HOST_IDENTITY_NOT_OWNER_ENV_VAR.
+        "OMNIGENT_HOST_IDENTITY_NOT_SESSION_OWNER",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips

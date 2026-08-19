@@ -406,6 +406,16 @@ if host_auth:
             # file (and the PAT in it): `Config._known_file_config_loader`
             # skips that file only when NO profile is named.
             "unset DATABRICKS_CONFIG_PROFILE",
+            # This host authenticates as a service principal, so its identity
+            # is NOT the session owner's. Without this marker the runner takes
+            # the host's bearer as its own identity, the coordinator resolves
+            # it to the service principal, and every owner-scoped route answers
+            # 404 -- surfacing as "harness_spawn_failed" with the agent spec
+            # "not found". The marker makes the runner keep that bearer as
+            # proxy auth only and take its identity from the owner-scoped
+            # delegated mint.
+            "OMNIGENT_HOST_IDENTITY_NOT_SESSION_OWNER=1",
+            "export OMNIGENT_HOST_IDENTITY_NOT_SESSION_OWNER",
             remote_command,
         ]
     )

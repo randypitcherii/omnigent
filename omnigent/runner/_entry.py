@@ -445,6 +445,19 @@ class _InitialAuthTokenFactory:
             f = self._fallback_factory
             return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
+    def demote_to_proxy_bearer(self) -> None:
+        """Drop the host bearer as an *identity* while keeping it as proxy auth.
+
+        Used when the host's identity is not the session owner's: the bearer
+        can still get a request past the Databricks Apps OAuth edge, but it
+        resolves to the wrong principal on the coordinator, so the runner must
+        take its identity from the owner-scoped delegated mint instead. The
+        fallback chain (mint, then stored OIDC, then SDK OAuth) is exactly what
+        ``__call__`` resolves once the initial token is gone.
+        """
+        with self._lock:
+            self._initial_token = None
+
     def invalidate(self) -> bool:
         """Discard the host bearer so the next call resolves local auth."""
         with self._lock:
@@ -466,7 +479,10 @@ def _make_auth_token_factory(
 
     Resolution order:
       1. Host's current bearer, when injected for runner bootstrap. This is
-         used until rejection; local refreshable auth resolves lazily.
+         used until rejection; local refreshable auth resolves lazily. Skipped
+         as an identity (kept only as the mint's proxy bearer) when the host
+         declares its identity is not the session owner's -- see
+         ``HOST_IDENTITY_NOT_OWNER_ENV_VAR``.
       2. Host-delegated runner token, when the host launch marker and
          binding token are present.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
@@ -519,6 +535,7 @@ def _make_auth_token_factory(
     # from os.environ here ensures later harness/terminal children cannot
     # inherit it even if a spawn path bypasses the standard secret scrubber.
     from omnigent.runner.identity import (
+        HOST_IDENTITY_NOT_OWNER_ENV_VAR,
         RUNNER_DELEGATED_AUTH_ENV_VAR,
         RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -530,8 +547,19 @@ def _make_auth_token_factory(
         else ""
     )
     if initial_token and resolved_server_url:
-        _logger.info("using host-provided bearer for runner bootstrap")
-        return _InitialAuthTokenFactory(initial_token, resolved_server_url)
+        factory = _InitialAuthTokenFactory(initial_token, resolved_server_url)
+        if os.environ.get(HOST_IDENTITY_NOT_OWNER_ENV_VAR, "").strip() == "1":
+            # The host bearer would authenticate as the host's own principal,
+            # not the session owner's -- see HOST_IDENTITY_NOT_OWNER_ENV_VAR.
+            # Keep it only as the mint's proxy bearer.
+            _logger.info(
+                "host identity is not the session owner; using host bearer as proxy auth "
+                "only and taking runner identity from the delegated mint"
+            )
+            factory.demote_to_proxy_bearer()
+        else:
+            _logger.info("using host-provided bearer for runner bootstrap")
+        return factory
 
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
