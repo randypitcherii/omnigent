@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   moveToProject: vi.fn(),
   archive: vi.fn(),
   deleteConversation: vi.fn(),
+  restart: vi.fn(),
   markUnread: vi.fn(),
 }));
 
@@ -36,6 +37,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
       mutate: mocks.deleteConversation,
       isPending: false,
     }),
+    useRestartConversation: () => ({ mutate: mocks.restart, isPending: false }),
   };
 });
 
@@ -113,6 +115,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Archive",
       "Delete",
@@ -167,6 +170,27 @@ describe("HeaderConversationMenu", () => {
       id: "conv-1",
       deleteBranch: true,
     });
+  });
+
+  it("restarts the session only after the confirm dialog", () => {
+    renderMenu();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restart session…" }));
+    expect(screen.getByRole("heading", { name: "Restart session?" })).toBeInTheDocument();
+    expect(mocks.restart).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("heading", { name: "Restart session?" })).toBeNull();
+    expect(mocks.restart).not.toHaveBeenCalled();
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restart session…" }));
+    fireEvent.click(screen.getByTestId("header-restart-confirm"));
+    expect(mocks.restart).toHaveBeenCalledWith(
+      "conv-1",
+      expect.objectContaining({ onSuccess: expect.any(Function), onError: expect.any(Function) }),
+    );
   });
 
   it("labels project actions for filed and unfiled sessions", () => {
@@ -291,6 +315,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Archive",
       "Delete",
@@ -311,6 +336,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Rename",
       "Mark as unread",
+      "Restart session…",
       "Add to project",
       "Files",
       "Archive",

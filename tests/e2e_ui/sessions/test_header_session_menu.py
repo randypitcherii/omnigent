@@ -50,11 +50,12 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
         trigger.click()
 
         menu_items = page.get_by_role("menuitem")
-        expect(menu_items).to_have_count(6)
+        expect(menu_items).to_have_count(7)
         assert menu_items.all_inner_texts() == [
             "Pin",
             "Rename",
             "Mark as unread",
+            "Restart session…",
             "Add to project",
             "Archive",
             "Delete",
