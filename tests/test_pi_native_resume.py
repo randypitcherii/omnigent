@@ -183,14 +183,17 @@ def test_function_call_becomes_assistant_toolcall() -> None:
     assert block["arguments"] == {"cmd": "ls"}
 
 
-def test_function_output_becomes_toolresult() -> None:
+def test_matched_function_output_becomes_toolresult() -> None:
     records = pi_session_records_from_session_items(
-        [_function_output_item(call_id="call_1", output="file listing")],
+        [
+            _function_call_item(name="bash", call_id="call_1", arguments='{"cmd": "ls"}'),
+            _function_output_item(call_id="call_1", output="file listing"),
+        ],
         session_id="conv_abc",
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
     )
-    msg = records[1]["message"]
+    msg = records[2]["message"]
     assert msg["role"] == "toolResult"
     assert msg["toolCallId"] == "call_1"
     assert msg["content"] == [{"type": "text", "text": "file listing"}]
@@ -221,6 +224,68 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
     assert entries[0]["parentId"] is None
     for prev, cur in itertools.pairwise(entries):
         assert cur["parentId"] == prev["id"]
+
+
+def test_parallel_tool_calls_are_grouped_before_delayed_results() -> None:
+    first_call = _function_call_item(
+        name="read", call_id="c1", arguments='{"path":"a.txt"}', item_id="fc1"
+    )
+    first_call["model"] = "call-model"
+    items = [
+        _user_item("read both files", item_id="u1"),
+        first_call,
+        _function_call_item(
+            name="read", call_id="c2", arguments='{"path":"b.txt"}', item_id="fc2"
+        ),
+        _assistant_item("I will compare both results.", item_id="a1", model="text-model"),
+        _function_output_item(call_id="c1", output="alpha", item_id="fo1"),
+        _function_output_item(call_id="c2", output="beta", item_id="fo2"),
+        _assistant_item("The files differ.", item_id="a2", model="final-model"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+        model="default-model",
+    )
+    entries = records[1:]
+
+    assert [entry["message"]["role"] for entry in entries] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "assistant",
+        "assistant",
+    ]
+    tool_message = entries[1]["message"]
+    assert tool_message["model"] == "call-model"
+    assert [block["id"] for block in tool_message["content"] if block["type"] == "toolCall"] == [
+        "c1",
+        "c2",
+    ]
+    assert [entry["message"]["toolCallId"] for entry in entries[2:4]] == ["c1", "c2"]
+    assert entries[4]["message"]["content"][0]["text"] == "I will compare both results."
+    assert entries[4]["message"]["model"] == "text-model"
+    assert entries[5]["message"]["content"][0]["text"] == "The files differ."
+    assert entries[5]["message"]["model"] == "final-model"
+    for prev, cur in itertools.pairwise(entries):
+        assert cur["parentId"] == prev["id"]
+
+
+def test_orphan_tool_result_is_dropped() -> None:
+    records = pi_session_records_from_session_items(
+        [
+            _user_item("hello", item_id="u1"),
+            _function_output_item(call_id="missing", output="orphan", item_id="fo1"),
+            _assistant_item("hi", item_id="a1"),
+        ],
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    assert [entry["message"]["role"] for entry in records[1:]] == ["user", "assistant"]
 
 
 def test_empty_text_items_are_dropped() -> None:
