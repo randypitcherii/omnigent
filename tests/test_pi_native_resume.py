@@ -76,6 +76,29 @@ def _function_output_item(
     }
 
 
+def _assert_tool_adjacency(records: list[dict[str, Any]]) -> None:
+    entries = records[1:]
+    matched_result_indices: set[int] = set()
+    for index, entry in enumerate(entries):
+        message = entry["message"]
+        if message["role"] != "assistant":
+            continue
+        call_ids = [block["id"] for block in message["content"] if block.get("type") == "toolCall"]
+        if not call_ids:
+            continue
+        result_ids: list[str] = []
+        cursor = index + 1
+        while cursor < len(entries) and entries[cursor]["message"]["role"] == "toolResult":
+            result_ids.append(entries[cursor]["message"]["toolCallId"])
+            matched_result_indices.add(cursor)
+            cursor += 1
+        assert len(result_ids) == len(call_ids)
+        assert set(result_ids) == set(call_ids)
+    assert {
+        index for index, entry in enumerate(entries) if entry["message"]["role"] == "toolResult"
+    } == matched_result_indices
+
+
 # --------------------------------------------------------------------------
 # safe-id guard
 # --------------------------------------------------------------------------
@@ -169,7 +192,10 @@ def test_assistant_message_has_required_metadata() -> None:
 
 def test_function_call_becomes_assistant_toolcall() -> None:
     records = pi_session_records_from_session_items(
-        [_function_call_item(name="bash", call_id="call_1", arguments='{"cmd": "ls"}')],
+        [
+            _function_call_item(name="bash", call_id="call_1", arguments='{"cmd": "ls"}'),
+            _function_output_item(call_id="call_1", output="done"),
+        ],
         session_id="conv_abc",
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
@@ -224,6 +250,7 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
     assert entries[0]["parentId"] is None
     for prev, cur in itertools.pairwise(entries):
         assert cur["parentId"] == prev["id"]
+    _assert_tool_adjacency(records)
 
 
 def test_parallel_tool_calls_are_grouped_before_delayed_results() -> None:
@@ -257,21 +284,154 @@ def test_parallel_tool_calls_are_grouped_before_delayed_results() -> None:
         "toolResult",
         "toolResult",
         "assistant",
-        "assistant",
     ]
     tool_message = entries[1]["message"]
     assert tool_message["model"] == "call-model"
-    assert [block["id"] for block in tool_message["content"] if block["type"] == "toolCall"] == [
-        "c1",
-        "c2",
+    assert [
+        (block["type"], block.get("id"), block.get("text")) for block in tool_message["content"]
+    ] == [
+        ("toolCall", "c1", None),
+        ("toolCall", "c2", None),
+        ("text", None, "I will compare both results."),
     ]
     assert [entry["message"]["toolCallId"] for entry in entries[2:4]] == ["c1", "c2"]
-    assert entries[4]["message"]["content"][0]["text"] == "I will compare both results."
-    assert entries[4]["message"]["model"] == "text-model"
-    assert entries[5]["message"]["content"][0]["text"] == "The files differ."
-    assert entries[5]["message"]["model"] == "final-model"
+    assert entries[4]["message"]["content"][0]["text"] == "The files differ."
+    assert entries[4]["message"]["model"] == "final-model"
     for prev, cur in itertools.pairwise(entries):
         assert cur["parentId"] == prev["id"]
+    _assert_tool_adjacency(records)
+
+
+def test_interleaved_response_ids_do_not_orphan_later_results() -> None:
+    items = [
+        _user_item("run both", item_id="u1", response_id="request"),
+        _function_call_item(
+            name="read", call_id="a1", arguments='{"path":"a"}', item_id="fca1", response_id="ra"
+        ),
+        _assistant_item("unrelated", item_id="other", response_id="rb"),
+        _function_call_item(
+            name="read", call_id="a2", arguments='{"path":"b"}', item_id="fca2", response_id="ra"
+        ),
+        _function_output_item(call_id="a1", output="A", item_id="foa1", response_id="ra"),
+        _function_output_item(call_id="a2", output="B", item_id="foa2", response_id="ra"),
+        _assistant_item("done", item_id="done", response_id="ra"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+
+    entries = records[1:]
+    tool_entry = next(
+        entry
+        for entry in entries
+        if any(block.get("type") == "toolCall" for block in entry["message"].get("content", []))
+    )
+    assert [block["id"] for block in tool_entry["message"]["content"]] == ["a1", "a2"]
+    assert {
+        entry["message"]["toolCallId"]
+        for entry in entries
+        if entry["message"]["role"] == "toolResult"
+    } == {"a1", "a2"}
+    texts = [
+        block["text"]
+        for entry in entries
+        for block in entry["message"].get("content", [])
+        if block.get("type") == "text"
+    ]
+    assert "unrelated" in texts
+    assert "done" in texts
+    _assert_tool_adjacency(records)
+
+
+def test_incomplete_parallel_tool_response_is_skipped_whole() -> None:
+    items = [
+        _user_item("kept", item_id="u1", response_id="complete"),
+        _assistant_item("kept reply", item_id="a1", response_id="complete"),
+        _user_item("partial", item_id="u2", response_id="incomplete"),
+        _function_call_item(
+            name="read",
+            call_id="c1",
+            arguments='{"path":"a"}',
+            item_id="fc1",
+            response_id="incomplete",
+        ),
+        _function_call_item(
+            name="read",
+            call_id="c2",
+            arguments='{"path":"b"}',
+            item_id="fc2",
+            response_id="incomplete",
+        ),
+        _function_output_item(call_id="c1", output="A", item_id="fo1", response_id="incomplete"),
+        _assistant_item("partial reply", item_id="a2", response_id="incomplete"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+
+    assert [entry["message"]["role"] for entry in records[1:]] == ["user", "assistant"]
+    assert records[1]["message"]["content"][0]["text"] == "kept"
+    assert records[2]["message"]["content"][0]["text"] == "kept reply"
+
+
+def test_interrupted_tool_response_is_skipped_whole() -> None:
+    interrupted = _assistant_item("cancelled", item_id="a2", response_id="interrupted")
+    interrupted["interrupted"] = True
+    items = [
+        _user_item("kept", item_id="u1", response_id="complete"),
+        _assistant_item("kept reply", item_id="a1", response_id="complete"),
+        _user_item("cancel me", item_id="u2", response_id="interrupted"),
+        _function_call_item(
+            name="bash",
+            call_id="c1",
+            arguments='{"cmd":"sleep 10"}',
+            item_id="fc1",
+            response_id="interrupted",
+        ),
+        _function_output_item(
+            call_id="c1", output="cancelled", item_id="fo1", response_id="interrupted"
+        ),
+        interrupted,
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+
+    assert [entry["message"]["role"] for entry in records[1:]] == ["user", "assistant"]
+
+
+def test_grouped_tool_entry_ids_are_deterministic() -> None:
+    items = [
+        _function_call_item(name="read", call_id="c1", arguments="{}", item_id="fc1"),
+        _function_call_item(name="read", call_id="c2", arguments="{}", item_id="fc2"),
+        _assistant_item("reading", item_id="a1"),
+        _function_output_item(call_id="c1", output="A", item_id="fo1"),
+        _function_output_item(call_id="c2", output="B", item_id="fo2"),
+    ]
+    first = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    second = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+
+    assert [entry["id"] for entry in first[1:]] == [entry["id"] for entry in second[1:]]
+    _assert_tool_adjacency(first)
 
 
 def test_orphan_tool_result_is_dropped() -> None:

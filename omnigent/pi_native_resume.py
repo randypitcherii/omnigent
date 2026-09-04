@@ -222,8 +222,8 @@ def pi_session_records_from_session_items(
     - Matching ``function_call_output`` items -> the immediately following run
       of Pi ``toolResult`` messages.
 
-    Interrupted assistant turns (and the rest of their response group) are
-    skipped so a cancelled turn isn't restored as completed history.
+    Interrupted assistant turns and incomplete tool response groups are skipped
+    in full so a cancelled or partial turn isn't restored as completed history.
 
     :param items: Flat Omnigent item dicts in chronological order, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
@@ -249,25 +249,26 @@ def pi_session_records_from_session_items(
     records: list[_JsonObject] = [header]
     parent_id: str | None = None
     skip_response_ids = _interrupted_response_ids(items)
-    consumed_indices: set[int] = set()
+    tool_plans, consumed_indices, incomplete_indices = _pi_tool_turn_plans(
+        items,
+        session_id=session_id,
+        external_session_id=external_session_id,
+        timestamp=timestamp,
+        provider=provider,
+        model=model,
+        skip_response_ids=skip_response_ids,
+    )
 
     for index, item in enumerate(items):
-        if index in consumed_indices:
-            continue
         response_id = item.get("response_id")
         if isinstance(response_id, str) and response_id in skip_response_ids:
             continue
-        if item.get("type") == "function_call":
-            entries, consumed = _pi_tool_turn_entries(
-                items,
-                start_index=index,
-                session_id=session_id,
-                external_session_id=external_session_id,
-                timestamp=timestamp,
-                provider=provider,
-                model=model,
-            )
-            consumed_indices.update(consumed)
+        if index in incomplete_indices:
+            continue
+        if index in tool_plans:
+            entries = tool_plans[index]
+        elif index in consumed_indices:
+            continue
         elif item.get("type") == "function_call_output":
             # Results are emitted only with a preceding matched call.
             entries = []
@@ -288,112 +289,104 @@ def pi_session_records_from_session_items(
     return records
 
 
-def _pi_tool_turn_entries(
+def _pi_tool_turn_plans(
     items: list[_JsonObject],
     *,
-    start_index: int,
     session_id: str,
     external_session_id: str,
     timestamp: str,
     provider: str,
     model: str,
-) -> tuple[list[_JsonObject], set[int]]:
-    """Build one protocol-valid assistant tool turn and its matched results."""
-    response_id = items[start_index].get("response_id")
-    call_entries: list[tuple[int, str, _JsonObject]] = []
-    result_entries: list[tuple[int, str, _JsonObject]] = []
-    deferred_entries: list[tuple[int, _JsonObject]] = []
-    call_ids: set[str] = set()
-    result_call_ids: set[str] = set()
-    output_started = False
-    cursor = start_index
+    skip_response_ids: set[str],
+) -> tuple[dict[int, list[_JsonObject]], set[int], set[int]]:
+    """Plan complete tool turns globally so interleaved items cannot orphan results."""
+    response_items: dict[str | None, set[int]] = {}
+    calls: dict[str | None, list[tuple[int, str, _JsonObject]]] = {}
+    outputs: dict[str | None, list[tuple[int, str, _JsonObject]]] = {}
 
-    while cursor < len(items):
-        item = items[cursor]
-        if item.get("response_id") != response_id:
-            break
+    for index, item in enumerate(items):
+        response_id_value = item.get("response_id")
+        response_id = (
+            response_id_value if isinstance(response_id_value, str) and response_id_value else None
+        )
+        response_items.setdefault(response_id, set()).add(index)
+        if response_id is not None and response_id in skip_response_ids:
+            continue
         item_type = item.get("type")
-        if item_type == "message" and item.get("role") == "user":
-            break
-        if item_type == "function_call":
-            if output_started:
-                break
+        if item_type not in {"function_call", "function_call_output"}:
+            continue
+        converted = _pi_entries_from_session_item(
+            item,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            index=index,
+            timestamp=timestamp,
+            provider=provider,
+            model=model,
+        )
+        if not converted:
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        target = calls if item_type == "function_call" else outputs
+        target.setdefault(response_id, []).append((index, call_id, converted[0]))
+
+    plans: dict[int, list[_JsonObject]] = {}
+    consumed: set[int] = set()
+    incomplete: set[int] = set()
+    for response_id, response_calls in calls.items():
+        call_ids = [call_id for _, call_id, _ in response_calls]
+        if len(call_ids) != len(set(call_ids)):
+            incomplete.update(response_items[response_id])
+            continue
+
+        output_by_call_id: dict[str, tuple[int, _JsonObject]] = {}
+        for index, call_id, entry in outputs.get(response_id, []):
+            if call_id in call_ids and call_id not in output_by_call_id:
+                output_by_call_id[call_id] = (index, entry)
+        if any(call_id not in output_by_call_id for call_id in call_ids):
+            incomplete.update(response_items[response_id])
+            continue
+
+        result_entries = sorted(output_by_call_id.values())
+        first_output_index = result_entries[0][0]
+        assistant_parts: list[tuple[int, _JsonObject]] = [
+            (index, entry) for index, _, entry in response_calls
+        ]
+        for index in response_items[response_id]:
+            item = items[index]
+            if (
+                index >= first_output_index
+                or item.get("type") != "message"
+                or item.get("role") != "assistant"
+            ):
+                continue
             converted = _pi_entries_from_session_item(
                 item,
                 session_id=session_id,
                 external_session_id=external_session_id,
-                index=cursor,
+                index=index,
                 timestamp=timestamp,
                 provider=provider,
                 model=model,
             )
-            if converted:
-                message = cast(_JsonObject, converted[0]["message"])
-                content = cast(list[_JsonObject], message["content"])
-                call_id = cast(str, content[0]["id"])
-                if call_id not in call_ids:
-                    call_entries.append((cursor, call_id, converted[0]))
-                    call_ids.add(call_id)
-        elif item_type == "function_call_output":
-            call_id = item.get("call_id")
-            if isinstance(call_id, str) and call_id in call_ids and call_id not in result_call_ids:
-                output_started = True
-                converted = _pi_entries_from_session_item(
-                    item,
-                    session_id=session_id,
-                    external_session_id=external_session_id,
-                    index=cursor,
-                    timestamp=timestamp,
-                    provider=provider,
-                    model=model,
-                )
-                if converted:
-                    result_entries.append((cursor, call_id, converted[0]))
-                    result_call_ids.add(call_id)
-        elif item_type == "message" and item.get("role") == "assistant":
-            if output_started and result_call_ids == call_ids:
-                break
-            converted = _pi_entries_from_session_item(
-                item,
-                session_id=session_id,
-                external_session_id=external_session_id,
-                index=cursor,
-                timestamp=timestamp,
-                provider=provider,
-                model=model,
-            )
-            deferred_entries.extend((cursor, entry) for entry in converted)
-        cursor += 1
+            assistant_parts.extend((index, entry) for entry in converted)
 
-    if result_entries:
-        retained_call_ids = result_call_ids
-    elif not deferred_entries and cursor == len(items):
-        # Preserve a final pending tool turn when no result has arrived yet.
-        retained_call_ids = call_ids
-    else:
-        retained_call_ids = set()
-
-    retained_calls = [
-        (index, entry) for index, call_id, entry in call_entries if call_id in retained_call_ids
-    ]
-    entries: list[_JsonObject] = []
-    if retained_calls:
-        first_call = retained_calls[0][1]
-        first_message = cast(_JsonObject, first_call["message"])
+        assistant_parts.sort(key=lambda part: part[0])
+        first_part = assistant_parts[0][1]
+        first_message = cast(_JsonObject, first_part["message"])
         first_message["content"] = [
             block
-            for _, entry in retained_calls
+            for _, entry in assistant_parts
             for block in cast(list[_JsonObject], cast(_JsonObject, entry["message"])["content"])
         ]
-        entries.append(first_call)
-        entries.extend(entry for _, _, entry in result_entries)
-        entries.extend(entry for _, entry in deferred_entries)
+        anchor = assistant_parts[0][0]
+        plans[anchor] = [first_part, *(entry for _, entry in result_entries)]
+        consumed.update(index for index, _ in assistant_parts)
+        consumed.update(index for index, _ in result_entries)
 
-    consumed = {index for index, _, _ in call_entries}
-    consumed.update(index for index, _, _ in result_entries)
-    if result_entries:
-        consumed.update(index for index, _ in deferred_entries)
-    return entries, consumed
+    return plans, consumed, incomplete
 
 
 def _pi_entries_from_session_item(
