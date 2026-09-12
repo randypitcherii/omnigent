@@ -2,8 +2,8 @@
 
 Regression coverage: when Omnigent rebuilds a native Pi session from copied
 conversation items (a fork with carry-history, or a cold resume -- both go
-through :func:`omnigent.pi_native_resume.ensure_local_pi_resume_session` ->
-:func:`omnigent.pi_native_resume.pi_session_records_from_session_items`), each
+through :func:`omnigent.harnesses.pi_native.resume.ensure_local_pi_resume_session` ->
+:func:`omnigent.harnesses.pi_native.resume.pi_session_records_from_session_items`), each
 ``function_call`` is emitted as its OWN single-``toolCall`` assistant message
 and each ``function_call_output`` as an independent ``toolResult`` message. For
 a response with multiple (parallel) tool calls the rebuilt Pi JSONL therefore
@@ -156,6 +156,26 @@ def _anthropic_tool_pairing_violations(messages: list[Any]) -> list[str]:
             f"messages.{i}: {rid}" for rid in result_ids if rid not in prev_tool_use_ids
         )
     return violations
+
+
+def _anthropic_tool_ids(messages: list[Any]) -> tuple[set[str], set[str]]:
+    """Return tool-use and tool-result ids found in Anthropic messages."""
+    use_ids: set[str] = set()
+    result_ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                use_ids.add(block["id"])
+            elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                result_ids.add(block["tool_use_id"])
+    return use_ids, result_ids
 
 
 def _sse_text_and_parallel_tool_calls(
@@ -721,7 +741,7 @@ def _create_native_pi_session(base_url: str, runner_id: str) -> str:
     """Register the ``pi-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent pi`` ships
-    (:func:`omnigent.pi_native._materialize_pi_agent_spec`) and stamps the same
+    (:func:`omnigent.harnesses.pi_native.main._materialize_pi_agent_spec`) and stamps the same
     wrapper / terminal-first labels the CLI writes. Binding the session to the
     runner triggers the runner's pi-native auto-launch (tmux + bridge +
     extension + managed models.json).
@@ -730,7 +750,7 @@ def _create_native_pi_session(base_url: str, runner_id: str) -> str:
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    from omnigent.pi_native import _SESSION_LABELS, _materialize_pi_agent_spec
+    from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         spec_path = _materialize_pi_agent_spec(Path(tmp))
@@ -992,8 +1012,23 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
             timeout_s=_TURN_TIMEOUT_S,
             what="the forked session's follow-up request",
         )
-        if record["violations"]:
+        request_messages = record["body"].get("messages", [])
+        tool_use_ids, tool_result_ids = _anthropic_tool_ids(request_messages)
+        expected_tool_ids = {_CALL_ID_A, _CALL_ID_B}
+        if (
+            record["violations"]
+            or not expected_tool_ids <= tool_use_ids
+            or not expected_tool_ids <= tool_result_ids
+        ):
             _dump_diagnostics(pi_sidecar, runner_log, _session_items(base_url, fork_id))
+        assert expected_tool_ids <= tool_use_ids, (
+            "Forked pi-native session did not replay both parallel tool calls; "
+            f"expected {sorted(expected_tool_ids)}, saw {sorted(tool_use_ids)}."
+        )
+        assert expected_tool_ids <= tool_result_ids, (
+            "Forked pi-native session did not replay both parallel tool results; "
+            f"expected {sorted(expected_tool_ids)}, saw {sorted(tool_result_ids)}."
+        )
         assert not record["violations"], (
             "Forked pi-native session sent a rebuilt history that violates "
             "Anthropic's tool_use/tool_result pairing contract -- the live API "
