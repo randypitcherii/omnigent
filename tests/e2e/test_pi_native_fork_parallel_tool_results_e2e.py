@@ -680,6 +680,7 @@ def pi_fork_rig(
                         online = True
                         break
             except httpx.HTTPError:
+                # The server may refuse connections while it is still starting.
                 pass
             time.sleep(0.5)
         if not online:
