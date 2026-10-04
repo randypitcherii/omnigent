@@ -37,6 +37,17 @@ Platform behavior this launcher is built on (measured live, 2026-10-01):
   :meth:`start_host`, which is exactly the re-bootstrap this provider needs.
 - An exec against a ``STOPPED`` sandbox transparently starts it.
 
+Identity. By default the launcher acts as one deployment-wide identity (a
+config profile, or ``DATABRICKS_*`` env such as a Databricks App's service
+principal). With ``identity="owner"`` it instead acts *as the user who owns the
+host*: the server binds a resolver for that user's connected Databricks
+credential (:meth:`bind_owner_credential`, fed by Databricks Connect), and every
+create / get / start / stop / delete / exec call — plus the proxy bearer written
+into the sandbox — uses that user's own token. Each sandbox is therefore owned
+by, and only holds a credential for, its owner. A user who has not connected
+Databricks is refused with :class:`OwnerCredentialMissingError`; there is no
+fallback to the server identity.
+
 The SDK's default HTTP client retries timed-out requests, which re-executes a
 non-idempotent command. The exec client is therefore built with an HTTP
 timeout above the longest execution timeout this launcher requests, so a long
@@ -47,13 +58,15 @@ from __future__ import annotations
 
 import secrets
 import shlex
+import threading
 import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import click
 
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes.base import (
+    OwnerCredentialMissingError,
     RemoteCommandResult,
     SandboxGoneError,
     SandboxLauncher,
@@ -64,7 +77,7 @@ from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_n
 from omnigent.util.proxy_bearer import PROXY_BEARER_FILE_ENV_VAR
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
@@ -78,6 +91,15 @@ _STATE_TIMEOUT_S: float = 600.0
 _STATE_POLL_S: float = 1.0
 
 _HOST_LOG: str = "/tmp/omnigent-host.log"
+
+#: Seconds an owner-identity launcher reuses one resolved owner token before
+#: asking the server again. The server's resolver refreshes tokens well before
+#: expiry, so a token cached this long is always still valid; the cache only
+#: saves a store read (and a thread hop) per REST call while polling state.
+_OWNER_TOKEN_CACHE_S: float = 60.0
+
+#: The ``identity`` values :class:`DatabricksSandboxLauncher` accepts.
+DatabricksIdentity = Literal["server", "owner"]
 
 _RUNNING = "SANDBOX_STATE_RUNNING"
 _STOPPED = "SANDBOX_STATE_STOPPED"
@@ -110,6 +132,48 @@ def _is_not_found(exc: Exception) -> bool:
     return isinstance(exc, NotFound)
 
 
+def _reraise_owner_refusal(exc: Exception) -> None:
+    """Re-raise an owner-credential refusal unwrapped, so its message reaches the user."""
+    if isinstance(exc, OwnerCredentialMissingError):
+        raise exc
+
+
+def _normalize_host(host: str) -> str:
+    """``https://host`` without a trailing slash, lower-cased, for comparisons."""
+    value = host.strip().rstrip("/").lower()
+    if value and "://" not in value:
+        value = f"https://{value}"
+    return value
+
+
+_NOT_CONNECTED_MESSAGE = (
+    "Connect Databricks first: this server runs Databricks Sandboxes as your own "
+    "Databricks identity. Open Settings → Connections → Databricks, connect your "
+    "workspace, then try again."
+)
+
+
+def _owner_token_strategy(token: Callable[[], str]) -> Any:
+    """An SDK ``CredentialsStrategy`` that authenticates every request as the owner.
+
+    *token* is called per request (it caches internally), so a long-lived
+    client always sends the owner's current, server-refreshed token. Built
+    here rather than at module scope so importing this module never needs
+    ``databricks-sdk``.
+    """
+    from databricks.sdk.credentials_provider import CredentialsStrategy
+
+    class _OwnerTokenStrategy(CredentialsStrategy):
+        def auth_type(self) -> str:
+            return "omnigent-owner-oauth"
+
+        def __call__(self, cfg: Any) -> Callable[[], dict[str, str]]:
+            del cfg
+            return lambda: {"Authorization": f"Bearer {token()}"}
+
+    return _OwnerTokenStrategy()
+
+
 class DatabricksSandboxLauncher(SandboxLauncher):
     """
     Managed-host launcher for Databricks Sandbox over the REST API.
@@ -132,7 +196,16 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         host at it (:data:`~omnigent.util.proxy_bearer.PROXY_BEARER_FILE_ENV_VAR`).
         Required when the server sits behind the Databricks Apps OAuth proxy,
         which rejects the sandbox's own PAT. Refreshed on every start, resume,
-        and keepalive.
+        and keepalive. With ``identity="owner"`` this is the owner's token.
+    :param identity: ``"server"`` (default) acts as the deployment identity
+        (*profile* / ``DATABRICKS_*`` env). ``"owner"`` acts as the host's owner
+        through their connected Databricks credential (see the module
+        docstring); *profile* must then be unset.
+    :param workspace_host: With ``identity="owner"``, the only workspace an
+        owner's connection may target, e.g.
+        ``"https://my-workspace.cloud.databricks.com"``. A connection to any
+        other workspace is refused (its sandbox could not reach this server's
+        front door). ``None`` accepts the connection's workspace as-is.
     """
 
     provider: ClassVar[str] = "databricks"
@@ -147,12 +220,23 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         inactivity_timeout_s: int | None = None,
         bootstrap_command: str | None = None,
         proxy_bearer: bool = False,
+        identity: DatabricksIdentity = "server",
+        workspace_host: str | None = None,
     ) -> None:
+        if identity not in ("server", "owner"):
+            raise ValueError(f"identity must be 'server' or 'owner', got {identity!r}")
+        if identity == "owner" and profile:
+            raise ValueError("identity='owner' acts as the host owner; do not also set a profile")
         self._profile = profile
         self._proxy_bearer = proxy_bearer
         self._prefix = sandbox_id_prefix or "omnigent"
         self._inactivity_timeout_s = inactivity_timeout_s
         self._bootstrap_command = bootstrap_command
+        self._identity: DatabricksIdentity = identity
+        self._workspace_host = _normalize_host(workspace_host) if workspace_host else None
+        self._owner_resolver: Callable[[], Mapping[str, object] | None] | None = None
+        self._owner_token: tuple[str, float] | None = None
+        self._owner_lock = threading.Lock()
         self._client: Any = None
 
     @property
@@ -170,6 +254,56 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             git_clone_options=True,
         )
 
+    # ── Owner identity ──────────────────────────────────
+
+    @property
+    def owner_credential_provider(self) -> str | None:
+        """``"databricks"`` in owner-identity mode, else ``None``."""
+        return "databricks" if self._identity == "owner" else None
+
+    def bind_owner_credential(self, resolve: Callable[[], Mapping[str, object] | None]) -> None:
+        """Bind the resolver for the host owner's Databricks credential."""
+        self._owner_resolver = resolve
+        self._owner_token = None
+        self._client = None
+
+    def _resolve_owner(self) -> tuple[str, str]:
+        """Return the owner's ``(access_token, workspace_host)`` or refuse.
+
+        :raises OwnerCredentialMissingError: No resolver is bound (the server
+            has no Databricks Connect), the owner has not connected, or their
+            connection targets a workspace other than :attr:`_workspace_host`.
+        """
+        if self._owner_resolver is None:
+            raise OwnerCredentialMissingError(
+                "this server runs Databricks Sandboxes as each user's own identity "
+                "(sandbox.databricks.identity: owner) but Databricks Connect is not "
+                "configured — set OMNIGENT_DATABRICKS_CLIENT_ID / _CLIENT_SECRET"
+            )
+        payload = self._owner_resolver()
+        token = payload.get("token") if payload else None
+        host = payload.get("workspace_host") if payload else None
+        if not isinstance(token, str) or not token or not isinstance(host, str) or not host:
+            raise OwnerCredentialMissingError(_NOT_CONNECTED_MESSAGE)
+        host = _normalize_host(host)
+        if self._workspace_host is not None and host != self._workspace_host:
+            raise OwnerCredentialMissingError(
+                f"your Databricks connection is for {host}, but this server's sandboxes "
+                f"run in {self._workspace_host}. Reconnect Databricks to that workspace "
+                "(Settings → Connections → Databricks), then try again."
+            )
+        return token, host
+
+    def _owner_access_token(self) -> str:
+        """The owner's current token, re-resolved at most every 60s (thread-safe)."""
+        with self._owner_lock:
+            cached = self._owner_token
+            if cached is not None and time.monotonic() - cached[1] < _OWNER_TOKEN_CACHE_S:
+                return cached[0]
+            token, _host = self._resolve_owner()
+            self._owner_token = (token, time.monotonic())
+            return token
+
     # ── SDK plumbing ────────────────────────────────────
 
     def _workspace_client(self) -> Any:
@@ -184,7 +318,17 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                     "(pip install 'omnigent[databricks]')"
                 ) from exc
             kwargs: dict[str, Any] = {"http_timeout_seconds": _EXEC_HTTP_TIMEOUT_S}
-            if self._profile:
+            if self._identity == "owner":
+                # Resolve up front: refuses an unconnected owner before any call,
+                # and pins the client to the owner's workspace. Explicit
+                # host + credentials_strategy win over any DATABRICKS_* env (the
+                # server's own identity), so nothing here can act as the server.
+                token, host = self._resolve_owner()
+                with self._owner_lock:
+                    self._owner_token = (token, time.monotonic())
+                kwargs["host"] = host
+                kwargs["credentials_strategy"] = _owner_token_strategy(self._owner_access_token)
+            elif self._profile:
                 kwargs["profile"] = self._profile
             self._client = WorkspaceClient(config=Config(**kwargs))
         return self._client
@@ -212,6 +356,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         try:
             return self._call("GET", self._resource(sandbox_id))
         except Exception as exc:
+            _reraise_owner_refusal(exc)
             if _is_not_found(exc):
                 raise SandboxGoneError(
                     f"Databricks Sandbox '{sandbox_id}' no longer exists"
@@ -243,6 +388,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         except click.ClickException:
             raise
         except Exception as exc:
+            _reraise_owner_refusal(exc)
             raise click.ClickException(
                 f"could not reach the Databricks Sandbox API "
                 f"(profile={self._profile or '<default>'}): {exc}"
@@ -258,6 +404,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         try:
             self._call("POST", "/api/2.0/sandboxes", query={"sandbox_id": sandbox_id}, body=body)
         except Exception as exc:
+            _reraise_owner_refusal(exc)
             raise click.ClickException(f"could not create a Databricks Sandbox: {exc}") from exc
         try:
             waited = self._wait_for(sandbox_id, _RUNNING)
@@ -280,6 +427,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             try:
                 self._call("POST", f"{self._resource(sandbox_id)}/start", body={})
             except Exception as exc:
+                _reraise_owner_refusal(exc)
                 if _is_not_found(exc):
                     raise SandboxGoneError(
                         f"Databricks Sandbox '{sandbox_id}' no longer exists"
@@ -310,6 +458,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         try:
             self._call("DELETE", self._resource(sandbox_id))
         except Exception as exc:
+            _reraise_owner_refusal(exc)
             if _is_not_found(exc):
                 return
             raise click.ClickException(
@@ -345,6 +494,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
                 "POST", f"/api/2.0/sandbox-exec/sandboxes/{sandbox_id}/exec-sync", body=body
             )
         except Exception as exc:
+            _reraise_owner_refusal(exc)
             if _is_not_found(exc):
                 raise SandboxGoneError(
                     f"Databricks Sandbox '{sandbox_id}' no longer exists"
