@@ -4584,8 +4584,9 @@ def server(
         dbx_cipher = build_secret_cipher()
         if dbx_cipher is None:
             logging.getLogger(__name__).error(
-                "Databricks Connect is configured but disabled: set the credential "
-                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+                "Databricks Connect is configured but disabled: configure the credential "
+                "store's cipher (OMNIGENT_CREDENTIAL_KMS_KEY_ID, _VAULT_KEY or _AES_KEY) "
+                "to enable it."
             )
         else:
             from omnigent.connections.databricks import DatabricksConnectionStore

@@ -35,7 +35,7 @@ SecretContext = Mapping[str, str]
 CREDENTIAL_KMS_KEY_ENV_VAR = "OMNIGENT_CREDENTIAL_KMS_KEY_ID"
 
 #: Optional explicit backend selector for the credential store's cipher
-#: (``kms`` | ``vault``). Set it to pick a backend per server; its key env var is
+#: (``kms`` | ``vault`` | ``aes``). Set it to pick a backend per server; its key env var is
 #: then required. Unset ⇒ the single configured backend is auto-detected, and
 #: configuring more than one without this selector is an error.
 CREDENTIAL_CIPHER_ENV_VAR = "OMNIGENT_CREDENTIAL_CIPHER"
@@ -85,8 +85,9 @@ def build_secret_cipher() -> SecretCipher | None:
     """Construct the credential store's cipher from deployment config, or ``None``.
 
     The backend is configurable per server. Set ``OMNIGENT_CREDENTIAL_CIPHER`` to
-    choose one explicitly (``kms`` or ``vault``); its key env var
-    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` / ``OMNIGENT_CREDENTIAL_VAULT_KEY``) is then
+    choose one explicitly (``kms``, ``vault`` or ``aes``); its key env var
+    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` / ``OMNIGENT_CREDENTIAL_VAULT_KEY`` /
+    ``OMNIGENT_CREDENTIAL_AES_KEY``) is then
     required, and a mismatch raises rather than silently disabling the store. When
     the selector is unset, the single configured backend is auto-detected as a
     zero-config convenience; configuring more than one without a selector is an
@@ -96,11 +97,13 @@ def build_secret_cipher() -> SecretCipher | None:
     """
     # hvac / boto3 stay optional: each builder only reads env and constructs, so
     # importing and calling them here pulls no SDK and makes no network call.
+    from omnigent.stores.credential_store.aes_cipher import build_aes_secret_cipher
     from omnigent.stores.credential_store.vault_cipher import build_vault_secret_cipher
 
     builders: dict[str, Callable[[], SecretCipher | None]] = {
         "kms": build_kms_secret_cipher,
         "vault": build_vault_secret_cipher,
+        "aes": build_aes_secret_cipher,
     }
 
     selected = os.environ.get(CREDENTIAL_CIPHER_ENV_VAR, "").strip().lower()
