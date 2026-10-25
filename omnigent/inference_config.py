@@ -178,7 +178,10 @@ def resolve_bound_provider(
             family.resolve_model_tier(family.default_model) if family.default_model else None
         )
         if binding.model_allowlist is not None:
-            models = {f"model_{i}": model for i, model in enumerate(binding.model_allowlist)}
+            # Preserve only tier pins whose targets remain explicitly allowed.
+            models = {tier: model for tier, model in models.items()
+                      if model in binding.model_allowlist}
+            models.update({f"model_{i}": model for i, model in enumerate(binding.model_allowlist)})
         if default is not None:
             models["default"] = default
         families[name] = replace(family, models=models)
@@ -191,6 +194,13 @@ def resolve_bound_model(config: dict[str, object], harness: str, model: str | No
     if binding is None:
         return model
     selected = model or binding.default_model
+    # Native Claude's built-in aliases must resolve inside the bound provider,
+    # never against the CLI's private defaults or outside the saved allowlist.
+    if normalize_inference_harness(harness) == "claude-native" and selected in {"opus", "sonnet", "haiku"}:
+        provider = resolve_bound_provider(config, harness)
+        family = provider.families.get("anthropic") if provider is not None else None
+        if family is not None:
+            selected = family.models.get(selected, selected)
     if selected is None:
         provider = resolve_bound_provider(config, harness)
         if provider is not None:

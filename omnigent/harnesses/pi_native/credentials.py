@@ -163,6 +163,7 @@ class _PiProviderCompat(TypedDict, total=False):
     # of thinking.type.enabled + budget_tokens. Required for claude-4+ / claude-5
     # models which no longer accept thinking.type.enabled.
     forceAdaptiveThinking: bool
+    supportsEagerToolInputStreaming: bool
 
 
 class _PiProviderPayload(TypedDict):
@@ -388,6 +389,22 @@ class PiProviderConfig:
         # thinking level controls.
         if self.api == "anthropic-messages":
             provider["compat"] = {"forceAdaptiveThinking": True}
+            url = urlparse(self.base_url)
+            if _is_databricks_ai_gateway_url(self.base_url) or (
+                (url.hostname or "").endswith(_DATABRICKS_TRUSTED_HOST_SUFFIXES)
+                and url.path.rstrip("/") == "/serving-endpoints/anthropic"
+            ):
+                # Older workspace model schemas reject this optional Pi field.
+                provider["compat"]["supportsEagerToolInputStreaming"] = False
+                # Claude 4.5 still uses token-budget thinking. Keep adaptive
+                # mode for newer models in this same provider's catalog.
+                models[:] = [
+                    {**entry, "compat": {**entry.get("compat", {}),
+                                        "forceAdaptiveThinking": False}}
+                    if re.search(r"claude-(?:opus|sonnet|haiku)-4-5(?:-|$)",
+                                 str(entry.get("id", ""))) else entry
+                    for entry in models
+                ]
         providers = {self.provider_id: provider}
         providers.update(additional)
         return {"providers": providers}

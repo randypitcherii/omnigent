@@ -4321,9 +4321,11 @@ def _paste_and_submit(
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param text: Exact text to paste (already escaped as needed).
-    :param needle: Draft marker from :func:`_submit_needle`; empty skips
-        draft-visibility verification (blind submit).
+    :param needle: Draft marker from :func:`_submit_needle`; when empty,
+        only a rendered paste placeholder can confirm the draft.
     :returns: None.
+    :raises ClaudePromptTimeout: If the paste never visibly commits. The
+        executor reports an undelivered turn and tears down the uncertain pane.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
@@ -4378,21 +4380,26 @@ def _paste_and_submit(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
+    # load / large payloads); polling is deterministic. Never submit a paste
+    # we did not observe: readiness does not prove a paste committed.
+    # A dropped or unrecognized paste followed by a blind Enter returns success
+    # without a user transcript or error. Fail through the executor's
+    # undelivered/teardown path instead of silently losing the message.
     delivery_diagnostics.set_stage("waiting_for_draft")
     draft_seen = False
     pane = ""
+    last_pane = ""
     polls = 0
     empty_captures = 0
     paste_wait_started = time.monotonic()
     deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
         polls += 1
         empty_captures += not pane.strip()
+        if pane.strip():
+            last_pane = pane
         if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
@@ -4406,6 +4413,13 @@ def _paste_and_submit(
         polls=polls,
         empty_captures=empty_captures,
     )
+    if not draft_seen:
+        delivery_diagnostics.record_details(verification="draft_unconfirmed", submit_sent=False)
+        raise ClaudePromptTimeout(
+            f"Claude Code paste was not visibly confirmed within {_PASTE_COMMIT_TIMEOUT_S}s. "
+            "No submit Enter was sent; the message was not delivered."
+            + _format_terminal_failure_tail(last_pane)
+        )
     time.sleep(_PASTE_SETTLE_S)
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
@@ -4422,11 +4436,6 @@ def _paste_and_submit(
     )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
-    if not draft_seen:
-        delivery_diagnostics.record_details(verification="unverified")
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -6222,31 +6231,30 @@ def _submit_needle(content: str) -> str:
 
 
 def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
+    """Find a pasted draft across all rows of the live framed composer.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
+    Claude Code can render the glyph on an empty row and the pasted text
+    on continuation rows below it. Looking only after the last glyph then
+    misses a committed paste and disables submit verification. Limit the
+    scan to the live composer, ending at its closing rule, so transcript
+    echoes and footer text cannot masquerade as the draft. Ignore whitespace
+    when matching the marker to tolerate both word and mid-word pane wraps.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    row = _composer_row(pane)
+    if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
+    lines = pane.splitlines()
+    index = max(i for i, line in enumerate(lines) if line == row)
+    draft = [row.split(_CLAUDE_PROMPT_GLYPH, 1)[1]]
+    for line in lines[index + 1 :]:
+        if _is_box_rule(line):
+            break
+        draft.append(line)
+    text = "\n".join(draft)
+    if _PASTED_PLACEHOLDER_PREFIX in text:
         return True
-    return bool(needle) and needle in tail
+    marker = "".join(needle.split())
+    return bool(marker) and marker in "".join(text.split())
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
