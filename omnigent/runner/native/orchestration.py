@@ -6408,6 +6408,14 @@ async def _codex_discover_thread_and_forward(
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
         auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
         headers: dict[str, str] = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        # A managed Sandbox runner's bearer is its pool SP, not the session
+        # owner: carry the runner binding, or every forwarded write 404s.
+        from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+        binding_token = _runner_tunnel_binding_token_from_env()
+        if binding_token:
+            headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
 
         # Mirror the discovered Codex thread id onto the Omnigent session as its
         # external_session_id, the same way claude-native records its
@@ -6542,6 +6550,14 @@ async def _codex_forward_known_thread(
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
         auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        # A managed Sandbox runner's bearer is its pool SP, not the session
+        # owner: carry the runner binding, or every forwarded write 404s.
+        from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+        binding_token = _runner_tunnel_binding_token_from_env()
+        if binding_token:
+            headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
         await supervise_forwarder(
             base_url=server_url,
             headers=headers,
@@ -8915,6 +8931,14 @@ async def _auto_create_claude_terminal(
     from omnigent.cli_auth import databricks_request_headers
 
     _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
+    # Carry the authenticated runner binding on both the forwarder and the
+    # out-of-process permission hook. A pool SP is not the session owner.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    binding_token = _runner_tunnel_binding_token_from_env()
+    if binding_token:
+        _runner_headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding_token
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.harnesses.claude_native.main import (

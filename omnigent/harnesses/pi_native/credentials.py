@@ -164,6 +164,7 @@ class _PiProviderCompat(TypedDict, total=False):
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
     forceAdaptiveThinking: bool
+    supportsEagerToolInputStreaming: bool
 
 
 class _PiProviderPayload(TypedDict):
@@ -388,6 +389,13 @@ class PiProviderConfig:
             # Preserve the native default for unlisted models; model-level flags win.
             provider["compat"] = {"forceAdaptiveThinking": True}
             provider["models"] = [pi_model_with_thinking_defaults(entry) for entry in models]
+            url = urlparse(self.base_url)
+            if _is_databricks_ai_gateway_url(self.base_url) or (
+                (url.hostname or "").endswith(_DATABRICKS_TRUSTED_HOST_SUFFIXES)
+                and url.path.rstrip("/") == "/serving-endpoints/anthropic"
+            ):
+                # Older workspace model schemas reject this optional Pi field.
+                provider["compat"]["supportsEagerToolInputStreaming"] = False
         providers = {self.provider_id: provider}
         providers.update(additional)
         for provider_id, payload in providers.items():
