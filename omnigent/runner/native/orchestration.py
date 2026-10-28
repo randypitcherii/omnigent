@@ -6408,8 +6408,8 @@ async def _codex_discover_thread_and_forward(
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
         auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
         headers: dict[str, str] = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-        # A managed Sandbox runner's bearer is its pool SP, not the session
-        # owner: carry the runner binding, or every forwarded write 404s.
+        # Carry the runner binding: it ties this callback to the runner's
+        # managed host, and without it every forwarded write 404s (#2352).
         from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
         from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 
@@ -6550,8 +6550,8 @@ async def _codex_forward_known_thread(
         auth_factory = await asyncio.to_thread(_make_auth_token_factory)
         auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-        # A managed Sandbox runner's bearer is its pool SP, not the session
-        # owner: carry the runner binding, or every forwarded write 404s.
+        # Carry the runner binding: it ties this callback to the runner's
+        # managed host, and without it every forwarded write 404s (#2352).
         from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
         from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 
@@ -8932,7 +8932,7 @@ async def _auto_create_claude_terminal(
 
     _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
     # Carry the authenticated runner binding on both the forwarder and the
-    # out-of-process permission hook. A pool SP is not the session owner.
+    # out-of-process permission hook, so callbacks attribute to this runner.
     from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 
